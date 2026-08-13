@@ -15,7 +15,7 @@ términos de atribución y uso.
 
 ---
 
-## Para qué sirve
+## 📜 Para qué sirve
 
 Mientras navegás normalmente un objetivo dentro de scope, Surface Hound
 construye en segundo plano un mapa completo de su superficie de ataque —
@@ -30,44 +30,127 @@ un paso aparte con otra herramienta. Y cuando encontrás algo que vale la
 pena profundizar, tenés un puente directo a tu toolkit de línea de
 comandos sin salir del navegador.
 
-## Qué hace
+## 📌 El panel, pestaña por pestaña
 
-- **Mapea la superficie de ataque en vivo**: cada request que hace el
-  navegador (fetch, XHR, recursos) se captura automáticamente — endpoint,
-  método, parámetros, headers de autenticación, content-type, tamaño de
-  respuesta, y hasta el script exacto del sitio que originó el request
-- **Clasifica parámetros por hipótesis de vulnerabilidad** (IDOR, SSRF,
-  Open Redirect, LFI, SQLi, SSTI, Mass Assignment, XSS, Command Injection),
-  cada uno con su CWE y payloads sugeridos para probar
-- **Detecta candidatos IDOR con scoring real**, no solo "tiene `id` en el
-  nombre": combina si es un ID numérico o UUID, si es parte del path o de
-  la query, si el nombre del recurso es reconocible, cuántos valores
-  distintos se observaron, y si el valor se vio reflejado en una respuesta
-  JSON — todo eso se traduce en un porcentaje de confianza (nunca 100%
-  desde análisis pasivo) y una lista de señales concretas
-- **Correlaciona entidades**: si dos IDs distintos aparecen juntos en el
-  mismo JSON (ej. `user_id` + `organization_id`), quedan conectados en un
-  grafo — útil para detectar acceso horizontal entre tenants/organizaciones
-- **Decodifica JWTs** con un sistema de 4 niveles de confianza
-  (`OBSERVED`/`SUSPICIOUS`/`CANDIDATE`, nunca `CONFIRMED` desde análisis
-  pasivo) en vez de gritar "vulnerable" por cada `alg: HS256`
-- **Escanea secretos expuestos** en el JS del sitio (AWS, GitHub, Slack,
-  Stripe, claves privadas...) con confianza calculada por tipo, filtro de
-  entropía para descartar placeholders, y distinción explícita entre
-  secretos reales y claves que son públicas por diseño (Stripe
-  publishable, Firebase config, Sentry DSN)
-- **Detecta misconfiguraciones CORS/CSP**, con tarjetas de detalle que
-  explican qué significa cada hallazgo, por qué importa, y qué validación
-  activa hace falta para confirmarlo — nunca lo presenta como vulnerabilidad
-  confirmada solo por observación pasiva
-- **Puente a tu CLI local**: ejecutá nuclei/httpx/katana/arjun/dalfox/
-  ffuf/dnsx/gau/subfinder directo desde el panel, con streaming de salida
-  en vivo, cola de jobs concurrentes, y un modal de confirmación que te
-  muestra el comando exacto antes de correrlo
+Todo lo que sigue vive en el mismo panel (F12 → pestaña "Superficie de
+ataque", el popup, o la vista de pantalla completa) — este es el detalle
+de qué hace cada una:
 
-## Cómo funciona
+### 🗺️ Mapa
+Árbol interactivo de todo lo descubierto, agrupado por segmentos de path
+(`api` → `{id}` → `files` → `{id}` → `preview`). Los segmentos tipo ID
+muestran `{id}` con un sufijo corto para distinguirlos entre sí, y
+**doble clic revela y copia el valor real** al portapapeles. Cada nodo
+lleva el badge del nivel de confianza IDOR calculado (HIGH/MED/LOW) y el
+método HTTP — sólido si hubo una solicitud directa ahí, atenuado (`↓ GET`)
+si es un agregado de las rutas anidadas debajo. Clic en cualquier nodo con
+endpoint(s) despliega la ruta completa exacta (`GET https://…`).
 
-### Los tres modos de operación
+### 📡 Endpoints
+Lista completa de cada solicitud capturada: método, URL, cuántas veces se
+vio, hora del último, código HTTP, y si iba autenticada. Al expandir un
+endpoint: metadata (content-type, tamaño de respuesta, página que lo
+originó, y el script exacto del sitio que lo disparó, extraído del stack
+trace), una muestra de la respuesta capturada, los parámetros clasificados
+ahí, los hallazgos CORS/CSP asociados a ese endpoint puntual, y dos
+botones: **"Probar CORS ahora"** (dispara el request real y muestra los
+headers al instante) y **"Analizar con CLI"** (te lleva a la sección
+avanzada con el target precargado).
+
+### 🔎 Parámetros
+Cada parámetro visto, con su hipótesis de vulnerabilidad (IDOR, SSRF, Open
+Redirect, LFI, SQLi, SSTI, Mass Assignment, XSS, Command Injection), CWE
+correspondiente, y una lista de payloads concretos para probar a mano. Los
+parámetros propensos a falsos positivos (como `name`, `title`, `comment`
+para XSS/SSTI) muestran si el valor se vio **reflejado de verdad** en una
+respuesta capturada — si no hay esa corroboración, queda marcado como
+hipótesis por nombre solamente, no como hallazgo confirmado.
+
+### 🎯 IDOR
+Candidatos con **confidence % real** (nunca 100%, es análisis pasivo),
+calculado combinando: si es numérico/UUID, si es parte del path o de la
+query, si el nombre del recurso es reconocible, cuántos valores distintos
+se observaron, y si el valor apareció reflejado en una respuesta JSON.
+Cada tarjeta tiene:
+- **"Ver validación sugerida"**: arma la especificación del test (endpoint,
+  parámetro, ID sugerido para reemplazar, qué se necesita para validarlo)
+- **"Enviar a Burp"**: copia un request en texto crudo listo para pegar en
+  Repeater
+- **"Crear hallazgo"**: pre-completa automáticamente la pestaña
+  **Notas/Reporte** con título, severidad (mapeada del nivel HIGH/MED/LOW)
+  y el detalle completo — sin tener que escribirlo de cero
+
+### 🕸️ Entidades
+Grafo de correlación: cuando dos IDs distintos aparecen juntos en el mismo
+JSON (ej. `user_id` + `organization_id` en una misma respuesta), quedan
+conectados acá. Cada entidad muestra su clave=valor, cuántas veces se vio,
+con qué otras entidades está correlacionada (y cuántas veces), y en qué
+URLs apareció — útil para detectar acceso horizontal entre
+tenants/organizaciones sin tener que cruzar los datos a mano.
+
+### 🔑 JWT
+Cada token visto, decodificado (header + payload completos al expandir),
+con hallazgos clasificados en 4 niveles: `OBSERVED` (hecho objetivo, sin
+implicar vulnerabilidad), `SUSPICIOUS` (patrón que amerita revisión pero
+es común y a veces benigno), `CANDIDATE` (hipótesis de explotación
+concreta, no confirmada) — nunca `CONFIRMED` desde análisis pasivo. Por
+ejemplo, `alg: HS256` es solo `OBSERVED`; `alg: none` sube a `CANDIDATE`
+con la aclaración explícita de que falta probarlo activamente.
+
+### 🔓 Secretos
+Claves y tokens expuestos en el JS del sitio (AWS, GitHub, Slack, Stripe,
+claves privadas, y un patrón genérico con alta tasa de falsos positivos
+que se filtra por entropía). Cada uno con confianza % por tipo, exposición
+(dónde se encontró), y una marca explícita de **"público por diseño"**
+para claves que no son secretos por sí solas (Stripe publishable key,
+config de Firebase, DSN de Sentry) — en vez de tratarlas como hallazgo
+crítico igual que una AWS key real.
+
+### 🌐 CORS/CSP
+Cada hallazgo se puede expandir con doble clic a una tarjeta completa:
+Directiva, Valor observado, Origen, Tipo, Severidad, Confianza, una
+sección "¿Por qué importa?" que explica el riesgo sin sobre-afirmar
+explotabilidad, la Evidencia (header crudo capturado), y validación
+sugerida con botones **Ver respuesta**, **Ver headers**, **Copiar
+evidencia**, y **Marcar como falso positivo** (queda persistido y
+marcado visualmente, sin borrar el hallazgo).
+
+### 🛡️ Scope
+Definís un programa activo con patrones `allow`/`deny` (admite
+`*.dominio.com`). A partir de ahí, todo lo capturado se marca dentro/fuera
+de scope en el resto del panel, y **cualquier acción activa queda
+bloqueada contra objetivos fuera de scope** — sin importar el modo
+seleccionado. La validación se repite también del lado del agente nativo,
+no solo en la interfaz, como defensa en profundidad.
+
+### 📝 Notas / Reporte
+Acá armás el reporte final de la sesión:
+- **Agregar hallazgos a mano**: título, severidad (Critical/High/Medium/
+  Low/Informational) y un cuerpo libre para steps to reproduce e impacto
+- **Se completa solo** desde la pestaña IDOR con el botón "Crear hallazgo"
+  (trae el título, severidad y detalle ya armados, incluyendo las señales
+  que motivaron el candidato)
+- Lista de todos los hallazgos guardados en la sesión, con severidad y
+  fecha, para revisar antes de exportar
+- **"Exportar reporte"** (botón en el header, arriba de todo) descarga un
+  archivo Markdown con todos los hallazgos guardados, formateado para
+  adaptar directo a HackerOne/Bugcrowd/Intigriti — con la evidencia y el
+  confidence % de cada uno, no solo el título
+
+## 🔐 Controles generales (header del panel)
+
+- **Modo Pasivo / Asistido / Activo** — qué tan lejos puede llegar la
+  extensión sin pedírtelo explícitamente (ver tabla abajo)
+- **Línea de estado** (`● MODO · SCOPE: ON/OFF · AGENT: ONLINE/OFFLINE`) —
+  de un vistazo, si estás generando tráfico, si hay scope configurado, y
+  si el puente CLI está conectado
+- **Selector de dominio** (en la vista de pantalla completa) — cambiá
+  entre todos los dominios que ya capturaste sin perder el historial
+- **Refrescar / Exportar reporte / Limpiar dominio / Limpiar TODOS** —
+  este último borra todo el storage acumulado de todos los dominios, útil
+  si `chrome.storage.local` se llena en una sesión larga
+
+### 📊 Los tres modos de operación
 
 | Modo | Qué desbloquea |
 |---|---|
@@ -75,20 +158,21 @@ comandos sin salir del navegador.
 | **Asistido** | Habilita chequeos puntuales de un clic (ej. probar CORS en vivo) y arma especificaciones de test para copiar a Burp — sin ejecutar nada por su cuenta. |
 | **Activo** | Habilita el envío de comandos a tus herramientas CLI a través del agente nativo. |
 
-### Scope Guard
+### 🔗 Puente a tu CLI local
 
-Definís un programa activo con patrones `allow`/`deny` (admite
-`*.dominio.com`). Todo lo capturado se marca dentro/fuera de scope, y
-**cualquier acción activa queda bloqueada contra objetivos fuera de
-scope**, sin importar el modo seleccionado — la validación se repite
-también del lado del agente nativo, no solo en la interfaz.
+Desde "Análisis avanzado" (dentro de Endpoints), ejecutá nuclei / httpx /
+katana / arjun / dalfox / ffuf / dnsx / gau / subfinder directo contra
+cualquier endpoint capturado. Antes de correr nada, aparece un modal
+mostrando el **comando exacto** que se va a ejecutar y recomendándote
+correrlo en tu propia terminal para mejores resultados (menos límites de
+timeout, sin salida truncada) — con opción de copiarlo o de igual forma
+ejecutarlo desde la extensión. Los jobs corren en cola (varios en
+paralelo), con streaming de salida en vivo y la posibilidad de expandir
+cada uno para ver su resultado completo.
 
-## Instalación
+## ⚙️ Instalación
 
 ### 1. Descargar
-
-Cloná el repo (o descargalo como zip si es privado y no tenés acceso SSH
-configurado):
 
 ```bash
 git clone https://github.com/Zuk4r1/surface-hound.git
@@ -129,7 +213,7 @@ Funciona igual en Windows, Linux y macOS — en Windows genera automáticamente
 el `.bat` necesario y se registra en el Registro de Windows, sin pasos
 manuales adicionales. Recargá la extensión después de instalar el agente.
 
-## Uso rápido
+## 🎛️ Uso rápido
 
 1. Navegá el objetivo normalmente — todo se captura solo
 2. Abrí el panel (F12 → pestaña "Superficie de ataque", o el popup)
@@ -137,10 +221,18 @@ manuales adicionales. Recargá la extensión después de instalar el agente.
    puente CLI
 4. Revisá **Mapa** para la vista general, **IDOR** para candidatos con
    confianza calculada, **Entidades** para correlaciones entre recursos
-5. Guardá lo que confirmes en **Notas / Reporte** y exportalo en Markdown
-   al terminar la sesión.
+5. Guardá lo que confirmes en **Notas / Reporte** (a mano, o con "Crear
+   hallazgo" desde IDOR) y exportalo en Markdown al terminar la sesión.
 
-## Licencia y autoría
+## ⚖️ Licencia y autoría
 
 Ver [LICENSE](./LICENSE). Cualquier redistribución (modificada o no) debe
 mantener la atribución a Zuk4r1 (Yordan Suárez).
+
+---
+
+## ☕ Apoya mis proyectos
+
+Si te resultan útil el proyecto, considera dar una ⭐ en GitHub o invitarme un café. ¡Gracias!
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/investigacq)  [![PayPal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://www.paypal.me/yordansuarezrojas)
