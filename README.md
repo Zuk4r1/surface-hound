@@ -91,7 +91,7 @@ Cloná el repo (o descargalo como zip si es privado y no tenés acceso SSH
 configurado):
 
 ```bash
-git clone <url-de-tu-repo-privado>
+git clone https://github.com/Zuk4r1/surface-hound.git
 cd surface-hound
 ```
 
