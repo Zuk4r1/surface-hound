@@ -1,0 +1,62 @@
+{
+  "manifest_version": 3,
+  "name": "Surface Hound",
+  "version": "0.9.6",
+  "description": "Reconocimiento pasivo en vivo y puente a herramientas locales para bug bounty.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "surface-hound@local.dev",
+      "strict_min_version": "128.0"
+    }
+  },
+  "permissions": [
+    "webRequest",
+    "storage",
+    "tabs",
+    "downloads",
+    "nativeMessaging",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "network-interceptor.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "devtools_page": "devtools.html",
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Surface Hound"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "author": "Zuk4r1 (Yordan Su\u00e1rez)"
+}

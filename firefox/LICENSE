@@ -1,0 +1,30 @@
+Surface Hound
+Copyright (c) 2026 Zuk4r1 (Yordan Suárez)
+
+Todos los derechos reservados sobre la autoría original de este proyecto
+("Surface Hound"), incluyendo su código fuente, diseño de arquitectura,
+documentación y assets, salvo donde se indique explícitamente lo contrario.
+
+Se permite el uso, modificación y distribución de este software para fines
+de investigación de seguridad, bug bounty y aprendizaje, siempre que:
+
+1. Se mantenga esta nota de copyright y atribución de autoría
+   ("Creado por Zuk4r1 (Yordan Suárez)") en el código fuente y en cualquier
+   redistribución, modificada o no.
+2. Cualquier trabajo derivado deje explícitamente indicado que está basado
+   en Surface Hound, con enlace o referencia a la autoría original.
+3. No se elimine ni se oscurezca la atribución de autoría presente en los
+   encabezados de los archivos fuente, el manifest de la extensión, ni la
+   interfaz de usuario (panel/popup).
+
+Está expresamente prohibido:
+- Redistribuir este software (total o parcialmente, modificado o no) bajo
+  un nombre distinto sin la atribución correspondiente al autor original.
+- Presentar este trabajo, o una versión derivada de él, como creación
+  propia de un tercero.
+
+Este software se entrega "tal cual", sin garantía de ningún tipo, expresa
+o implícita. El autor no se hace responsable por el uso que terceros le
+den a esta herramienta -- ver README.md para el alcance de uso previsto
+(programas de bug bounty autorizados, VDP, pentesting contratado, CTF y
+laboratorios propios).

@@ -1,0 +1,132 @@
+<!-- Surface Hound — Creado por Zuk4r1 (Yordan Suárez) — ver LICENSE -->
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="fullview.css">
+</head>
+<body>
+  <header>
+    <h1 id="domain-title">Superficie de ataque</h1>
+    <div class="mode-switch" id="mode-switch">
+      <button class="mode-btn" data-mode="passive">Pasivo</button>
+      <button class="mode-btn" data-mode="assisted">Asistido</button>
+      <button class="mode-btn" data-mode="active">Activo</button>
+    </div>
+    <div class="actions">
+      <button id="refresh">Refrescar</button>
+      <button id="export">Exportar reporte</button>
+      <button id="clear">Limpiar dominio</button>
+      <button id="clear-all" title="Borra TODOS los dominios capturados, no solo este">Limpiar TODOS</button>
+    </div>
+  </header>
+  <div id="status-line" class="status-line"></div>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="mapa">Mapa</button>
+    <button class="tab-btn" data-tab="endpoints">Endpoints</button>
+    <button class="tab-btn" data-tab="params">Parámetros</button>
+    <button class="tab-btn" data-tab="idor">IDOR</button>
+    <button class="tab-btn" data-tab="entidades">Entidades</button>
+    <button class="tab-btn" data-tab="jwt">JWT</button>
+    <button class="tab-btn" data-tab="secrets">Secretos</button>
+    <button class="tab-btn" data-tab="cors">CORS/CSP</button>
+    <button class="tab-btn" data-tab="scope">Scope</button>
+    <button class="tab-btn" data-tab="notes">Notas / Reporte</button>
+  </nav>
+
+  <main>
+    <section id="tab-mapa" class="tab-content active">
+      <div class="hint" style="margin-bottom:8px">Árbol de endpoints descubiertos. Los nodos en color son parámetros/IDs con hipótesis de vulnerabilidad — clic para ver detalle.</div>
+      <div id="mapa-tree"></div>
+    </section>
+    <section id="tab-endpoints" class="tab-content">
+      <div id="endpoints-list"></div>
+
+      <details id="cli-section" style="margin-top:16px">
+        <summary style="cursor:pointer;color:#8b949e;font-size:12px">Análisis avanzado (línea de comandos) — opcional, para investigar más a fondo</summary>
+        <div class="note-form" style="flex-direction:row;align-items:center;gap:8px;margin:10px 0">
+          <input id="native-target" placeholder="URL objetivo (o clic en 'Analizar con CLI' de un endpoint)" style="flex:1">
+          <select id="native-action">
+            <option value="nuclei">nuclei</option>
+            <option value="httpx">httpx</option>
+            <option value="katana">katana</option>
+            <option value="arjun">arjun</option>
+            <option value="dalfox">dalfox</option>
+            <option value="ffuf">ffuf</option>
+            <option value="dnsx">dnsx</option>
+            <option value="gau">gau</option>
+            <option value="subfinder">subfinder</option>
+          </select>
+          <button id="native-run">Ejecutar</button>
+        </div>
+        <div class="hint">Cada clic en "Ejecutar" crea un job independiente — puedes tener varios corriendo a la vez.</div>
+        <div id="jobs-list" style="margin-top:8px"></div>
+      </details>
+    </section>
+    <section id="tab-params" class="tab-content"><div id="params-list"></div></section>
+    <section id="tab-idor" class="tab-content"><div id="idor-list"></div></section>
+    <section id="tab-entidades" class="tab-content">
+      <div class="hint" style="margin-bottom:8px">Entidades (IDs) vistas en URLs y cuerpos JSON, correlacionadas cuando aparecen juntas en el mismo payload. Útil para detectar acceso horizontal entre tenants/organizaciones.</div>
+      <div id="entidades-list"></div>
+    </section>
+    <section id="tab-jwt" class="tab-content"><div id="jwt-list"></div></section>
+    <section id="tab-secrets" class="tab-content"><div id="secrets-list"></div></section>
+    <section id="tab-cors" class="tab-content"><div id="cors-list"></div></section>
+    <section id="tab-scope" class="tab-content">
+      <div class="hint" style="margin-bottom:8px">
+        Define el scope del programa. Los endpoints fuera de scope se marcan
+        en el resto del panel y las acciones activas (CLI, chequeos en vivo)
+        quedan bloqueadas contra ellos, sin importar el modo seleccionado.
+      </div>
+      <div class="note-form">
+        <input id="scope-program" placeholder="Nombre del programa (ej: Tines)">
+        <label class="hint">Permitido (uno por línea, admite *.dominio.com)</label>
+        <textarea id="scope-allow" placeholder="*.tines.com"></textarea>
+        <label class="hint">Excluido explícitamente (uno por línea)</label>
+        <textarea id="scope-deny" placeholder="tines.io&#10;accounts.google.com"></textarea>
+        <button id="scope-save">Guardar scope</button>
+      </div>
+      <div id="scope-status" class="hint"></div>
+    </section>
+    <section id="tab-notes" class="tab-content">
+      <div class="note-form">
+        <input id="note-title" placeholder="Título del hallazgo (ej: IDOR en /api/orders/{id})">
+        <select id="note-severity">
+          <option>Critical</option>
+          <option>High</option>
+          <option selected>Medium</option>
+          <option>Low</option>
+          <option>Informational</option>
+        </select>
+        <textarea id="note-body" placeholder="Steps to reproduce / Impacto / Notas..."></textarea>
+        <button id="add-note">Agregar hallazgo</button>
+      </div>
+      <div id="notes-list"></div>
+    </section>
+  </main>
+
+  <div id="cli-confirm-overlay" class="modal-overlay" style="display:none">
+    <div class="modal-box">
+      <h2 class="modal-title">Recomendación antes de ejecutar</h2>
+      <p class="hint">
+        Correr esta herramienta a través de la extensión tiene límites reales
+        frente a correrla directo en tu terminal: timeout fijo, salida con
+        tope de líneas, y sin control interactivo ni posibilidad de
+        encadenar/redirigir la salida. Para mejores resultados y evitar
+        errores, te recomendamos copiar el comando y correrlo vos mismo.
+      </p>
+      <div class="hint" style="margin-top:10px;margin-bottom:4px"><b>Comando:</b></div>
+      <pre id="cli-confirm-command" class="mono modal-command"></pre>
+      <div class="detail-actions" style="margin-top:14px;justify-content:flex-end">
+        <button id="cli-confirm-copy">Copiar comando</button>
+        <button id="cli-confirm-cancel">Cancelar</button>
+        <button id="cli-confirm-run-anyway" class="modal-run-anyway">Ejecutar en la extensión de todos modos</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="../common/panel-core.js"></script>
+  <script src="fullview.js"></script>
+</body>
+</html>
