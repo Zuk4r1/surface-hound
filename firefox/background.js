@@ -289,6 +289,229 @@ function findRelatedEntities(data, key, value, limit = 5) {
     });
 }
 
+// ---- GraphQL: detección de operación, introspection y candidatos BFLA -----
+// Cualquier POST puede ser GraphQL sin importar la URL (no todos usan
+// /graphql), así que la detección es por FORMA del body, no por ruta.
+// Se hace en dos pasos a propósito por rendimiento: un chequeo barato de
+// substring ANTES de intentar JSON.parse, para no pagar el costo de parsear
+// el body de cada request JSON normal (la inmensa mayoría no es GraphQL).
+
+const GRAPHQL_OP_RE = /^\s*(query|mutation|subscription)\s*([A-Za-z_][A-Za-z0-9_]*)?/;
+
+function looksLikeGraphQLPayload(bodyText) {
+  return typeof bodyText === "string" && bodyText.length > 0 && bodyText.length < 20000 &&
+    (bodyText.includes('"query"') || bodyText.includes('"mutation"'));
+}
+
+// Soporta batching (GraphQL permite mandar un array de operaciones en un
+// solo request -- es del propio checklist de reconocimiento GraphQL, no
+// un caso raro).
+function parseGraphQLOperations(bodyText) {
+  if (!looksLikeGraphQLPayload(bodyText)) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return [];
+  }
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  const ops = [];
+  for (const item of items.slice(0, 20)) {
+    if (!item || typeof item.query !== "string") continue;
+    const queryText = item.query;
+    const match = queryText.match(GRAPHQL_OP_RE);
+    // "{ campo }" sin la palabra "query" adelante es una query implícita
+    // (shorthand válido de la spec de GraphQL), no una operación desconocida.
+    const operationType = match ? match[1].toLowerCase() : "query";
+    const operationName = (match && match[2]) || item.operationName || null;
+    const hasIntrospectionKeyword = /__schema\b|__type\b/.test(queryText);
+    ops.push({ operationType, operationName, hasIntrospectionKeyword });
+  }
+  return ops;
+}
+
+// Confirma introspection HABILITADA (no solo intentada): exige que la
+// respuesta tenga la forma real de una respuesta de introspection
+// ("__schema" junto con "queryType"/"types"), no solo la palabra suelta --
+// evita falsos positivos de un campo de negocio que coincidentemente se
+// llame parecido.
+function isIntrospectionResponseConfirmed(bodyText) {
+  if (typeof bodyText !== "string" || bodyText.length > 550000 || !bodyText.includes("__schema")) return false;
+  return /"queryType"/.test(bodyText) || /"types"\s*:\s*\[/.test(bodyText);
+}
+
+function ensureGraphQLData(data) {
+  if (!data.graphqlOperations) data.graphqlOperations = {};
+  if (!data.graphqlIntrospection) data.graphqlIntrospection = [];
+}
+
+function recordGraphQLOperations(data, url, method, ops) {
+  if (!ops.length) return;
+  ensureGraphQLData(data);
+  const now = Date.now();
+  for (const op of ops) {
+    // Clave por endpoint+tipo+nombre: si la misma query se repite (polling,
+    // refetch, etc.) se incrementa un contador en vez de acumular entradas
+    // nuevas sin límite -- esto es lo que evita que el storage crezca sin
+    // control en una sesión larga con una app que hace polling constante.
+    const opKey = `${method} ${url.split("?")[0]}::${op.operationType}:${op.operationName || "(anónima)"}`;
+    if (!data.graphqlOperations[opKey]) {
+      data.graphqlOperations[opKey] = {
+        endpoint: url, method,
+        operationType: op.operationType,
+        operationName: op.operationName,
+        hits: 0,
+        firstSeen: now,
+        introspectionRequested: false,
+      };
+    }
+    const rec = data.graphqlOperations[opKey];
+    rec.hits++;
+    rec.lastSeen = now;
+    if (op.hasIntrospectionKeyword) rec.introspectionRequested = true;
+  }
+}
+
+function recordGraphQLIntrospection(data, url, schemaJson) {
+  ensureGraphQLData(data);
+  const existing = data.graphqlIntrospection.find((f) => f.url === url);
+  if (existing) return; // ya está registrado para este endpoint, no duplicar
+  const finding = {
+    url,
+    confidence: 90,
+    severity: "high",
+    detectedAt: Date.now(),
+    note: "Se observó una respuesta con la forma real de un esquema de introspection (__schema + queryType/types), no solo la palabra suelta. Esto confirma que introspection está habilitada en este endpoint -- en producción, normalmente debería estar deshabilitada."
+  };
+  const analysis = analyzeGraphQLSchema(schemaJson);
+  if (analysis) finding.schemaAnalysis = analysis;
+  data.graphqlIntrospection.push(finding);
+}
+
+// ---- Análisis del schema completo (cuando introspection está habilitada) --
+// Cuando la introspection responde con el schema real, no solo confirmamos
+// que está habilitada -- lo PARSEAMOS de verdad para sacar lo que un hunter
+// senior mira a mano: qué mutations existen (incluso las que la UI de la
+// app nunca llama -- "shadow API" clásico), qué campos están deprecados,
+// qué campos suenan a datos sensibles, y el resto del sistema de tipos
+// (inputs/enums/interfaces/unions) que hace falta para armar payloads
+// válidos al probar cada operación.
+//
+// Límites de tamaño (MAX_TYPES/MAX_FIELDS_PER_TYPE/etc.) existen porque
+// algunos schemas públicos reales (GitHub, Shopify) tienen miles de tipos
+// -- sin tope, esto podría tardar en procesar y generar un objeto enorme
+// para guardar en storage.local, que tiene cuota.
+
+const MAX_TYPES = 500;
+const MAX_FIELDS_PER_TYPE = 60;
+const MAX_ENUM_VALUES = 25;
+const MAX_ROOT_FIELDS = 150;
+
+const SENSITIVE_FIELD_RE = /\b(password|passwd|secret|token|api[_-]?key|apikey|ssn|social[_-]?security|credit[_-]?card|creditcard|cvv|cvc|private[_-]?key|privatekey|access[_-]?token|refresh[_-]?token|auth[_-]?code|pin\b|otp\b|salary|bank[_-]?account)\b/i;
+
+const PRIVILEGED_MUTATION_RE = /^(delete|remove|destroy|ban|suspend|impersonate|grant|revoke|setrole|assignrole|makeadmin|promote|demote|disable|enable|force|purge|wipe|resetall|override)/i;
+
+function graphqlTypeToString(typeRef) {
+  if (!typeRef) return "?";
+  if (typeRef.kind === "NON_NULL") return graphqlTypeToString(typeRef.ofType) + "!";
+  if (typeRef.kind === "LIST") return "[" + graphqlTypeToString(typeRef.ofType) + "]";
+  return typeRef.name || "?";
+}
+
+function analyzeGraphQLSchema(schemaJson) {
+  let root;
+  try {
+    root = JSON.parse(schemaJson);
+  } catch {
+    return null;
+  }
+  const schema = root?.data?.__schema;
+  if (!schema || !Array.isArray(schema.types)) return null;
+
+  const typeByName = {};
+  for (const t of schema.types.slice(0, MAX_TYPES)) typeByName[t.name] = t;
+
+  const queryTypeName = schema.queryType?.name;
+  const mutationTypeName = schema.mutationType?.name;
+  const subscriptionTypeName = schema.subscriptionType?.name;
+
+  function extractRootFields(typeName) {
+    const t = typeByName[typeName];
+    if (!t || !Array.isArray(t.fields)) return [];
+    return t.fields.slice(0, MAX_ROOT_FIELDS).map((f) => ({
+      name: f.name,
+      returnType: graphqlTypeToString(f.type),
+      args: (f.args || []).map((a) => ({ name: a.name, type: graphqlTypeToString(a.type) })),
+    }));
+  }
+
+  const queryFields = queryTypeName ? extractRootFields(queryTypeName) : [];
+  const mutationFields = (mutationTypeName ? extractRootFields(mutationTypeName) : []).map((f) => ({
+    ...f,
+    looksPrivileged: PRIVILEGED_MUTATION_RE.test(f.name),
+  }));
+  const subscriptionFields = subscriptionTypeName ? extractRootFields(subscriptionTypeName) : [];
+
+  // Argumentos interesantes: cualquier argumento (en cualquier campo, no
+  // solo en la raíz) cuyo nombre suene a identificador de recurso -- son
+  // los candidatos naturales a IDOR/BOLA vía GraphQL, igual que un
+  // parámetro "id=" en REST.
+  const ID_ARG_RE = /^(id|.*Id|.*_id|uuid|.*Uuid|.*_uuid|pk|key)$/;
+  const interestingArgs = [];
+  const deprecatedFields = [];
+  const sensitiveFields = [];
+  const enums = [];
+  const inputs = [];
+  const interfaces = [];
+  const unions = [];
+
+  for (const t of schema.types.slice(0, MAX_TYPES)) {
+    if (!t.name || t.name.startsWith("__")) continue; // tipos internos de introspection, ruido
+
+    if (t.kind === "ENUM" && Array.isArray(t.enumValues)) {
+      enums.push({ name: t.name, values: t.enumValues.slice(0, MAX_ENUM_VALUES).map((v) => v.name) });
+    }
+    if (t.kind === "INPUT_OBJECT" && Array.isArray(t.inputFields)) {
+      inputs.push({
+        name: t.name,
+        fields: t.inputFields.slice(0, MAX_FIELDS_PER_TYPE).map((f) => ({ name: f.name, type: graphqlTypeToString(f.type) })),
+      });
+      for (const f of t.inputFields) {
+        if (SENSITIVE_FIELD_RE.test(f.name)) sensitiveFields.push({ typeName: t.name, fieldName: f.name });
+      }
+    }
+    if (t.kind === "INTERFACE") {
+      interfaces.push({ name: t.name, possibleTypesCount: (t.possibleTypes || []).length });
+    }
+    if (t.kind === "UNION") {
+      unions.push({ name: t.name, possibleTypes: (t.possibleTypes || []).slice(0, 20).map((p) => p.name) });
+    }
+    if (Array.isArray(t.fields)) {
+      for (const f of t.fields.slice(0, MAX_FIELDS_PER_TYPE)) {
+        if (f.isDeprecated) deprecatedFields.push({ typeName: t.name, fieldName: f.name, reason: f.deprecationReason || null });
+        if (SENSITIVE_FIELD_RE.test(f.name)) sensitiveFields.push({ typeName: t.name, fieldName: f.name });
+        for (const a of f.args || []) {
+          if (ID_ARG_RE.test(a.name)) {
+            interestingArgs.push({ typeName: t.name, fieldName: f.name, argName: a.name, argType: graphqlTypeToString(a.type) });
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    totalTypes: schema.types.length,
+    queryFields, mutationFields, subscriptionFields,
+    deprecatedFields: deprecatedFields.slice(0, 100),
+    sensitiveFields: sensitiveFields.slice(0, 100),
+    interestingArgs: interestingArgs.slice(0, 100),
+    enums: enums.slice(0, 100),
+    inputs: inputs.slice(0, 100),
+    interfaces: interfaces.slice(0, 100),
+    unions: unions.slice(0, 100),
+  };
+}
+
 // ---- Scoring de candidatos IDOR (multi-señal) ------------------------------
 
 function summarizeStack(stack) {
@@ -595,7 +818,11 @@ async function getDomainData(domain) {
       entityGraph: { nodes: {}, edges: {} },
       entitySeenInResponse: {},
       reflectedValues: {},
-      dismissedFindings: {}
+      dismissedFindings: {},
+      graphqlOperations: {},
+      graphqlIntrospection: [],
+      websockets: {},
+      techFingerprint: {}
     }
   );
 }
@@ -643,6 +870,118 @@ function headersToObject(headerArray) {
   const obj = {};
   for (const h of headerArray || []) obj[h.name.toLowerCase()] = h.value;
   return obj;
+}
+
+// ---- Fingerprinting de tecnología (100% pasivo) ---------------------------
+// Tres fuentes de señal, cada una ve algo que las otras no pueden:
+//  1. Headers de respuesta + cookies (acá mismo, via webRequest -- ve
+//     Set-Cookie completo, incluso cookies HttpOnly que document.cookie
+//     nunca podría ver desde JS)
+//  2. Firmas en el DOM (content.js, mundo aislado -- comparte el DOM con
+//     la página aunque no sus variables JS)
+//  3. Variables JS globales (network-interceptor.js, mundo MAIN -- ve
+//     window.React/Vue/etc., que el mundo aislado de content.js NO puede
+//     ver aunque comparta el mismo DOM)
+// Las tres alimentan la misma tabla dedupeada por nombre de tecnología, con
+// confianza que sube si se corrobora por más de una fuente.
+
+function getAllHeaderValues(headerArray, name) {
+  // headersToObject() colapsa duplicados (se queda con el último) -- para
+  // Set-Cookie eso pierde información real, porque una respuesta típica
+  // manda VARIOS Set-Cookie a la vez (sesión + CSRF + preferencias, etc.)
+  // y cada uno es una pista de tecnología distinta.
+  return (headerArray || []).filter((h) => h.name.toLowerCase() === name).map((h) => h.value);
+}
+
+const TECH_HEADER_RULES = [
+  { header: "x-powered-by", re: /php/i, name: "PHP", category: "Lenguaje", confidence: 85 },
+  { header: "x-powered-by", re: /express/i, name: "Express.js", category: "Framework", confidence: 85 },
+  { header: "x-powered-by", re: /asp\.net/i, name: "ASP.NET", category: "Framework", confidence: 85 },
+  { header: "x-powered-by", re: /next\.js/i, name: "Next.js", category: "Framework frontend", confidence: 90 },
+  { header: "x-aspnet-version", re: /.+/, name: "ASP.NET", category: "Framework", confidence: 80 },
+  { header: "x-aspnetmvc-version", re: /.+/, name: "ASP.NET MVC", category: "Framework", confidence: 85 },
+  { header: "x-generator", re: /drupal/i, name: "Drupal", category: "CMS", confidence: 85 },
+  { header: "x-drupal-cache", re: /.+/, name: "Drupal", category: "CMS", confidence: 80 },
+  { header: "server", re: /nginx/i, name: "nginx", category: "Servidor web", confidence: 70 },
+  { header: "server", re: /apache/i, name: "Apache", category: "Servidor web", confidence: 70 },
+  { header: "server", re: /microsoft-iis/i, name: "IIS", category: "Servidor web", confidence: 80 },
+  { header: "server", re: /cloudflare/i, name: "Cloudflare", category: "WAF/CDN", confidence: 80 },
+  { header: "server", re: /gunicorn/i, name: "Gunicorn (Python)", category: "Servidor web", confidence: 80 },
+  { header: "server", re: /kestrel/i, name: "Kestrel (ASP.NET Core)", category: "Servidor web", confidence: 80 },
+  { header: "server", re: /litespeed/i, name: "LiteSpeed", category: "Servidor web", confidence: 75 },
+  { header: "server", re: /caddy/i, name: "Caddy", category: "Servidor web", confidence: 75 },
+  { header: "cf-ray", re: /.+/, name: "Cloudflare", category: "WAF/CDN", confidence: 90 },
+  { header: "x-sucuri-id", re: /.+/, name: "Sucuri", category: "WAF/CDN", confidence: 90 },
+  { header: "x-akamai-transformed", re: /.+/, name: "Akamai", category: "WAF/CDN", confidence: 85 },
+  { header: "x-varnish", re: /.+/, name: "Varnish", category: "Cache/CDN", confidence: 75 },
+  { header: "x-amz-cf-id", re: /.+/, name: "Amazon CloudFront", category: "WAF/CDN", confidence: 85 },
+  { header: "x-vercel-id", re: /.+/, name: "Vercel", category: "Hosting", confidence: 85 },
+];
+
+const TECH_COOKIE_RULES = [
+  { re: /^PHPSESSID$/i, name: "PHP", category: "Lenguaje", confidence: 75 },
+  { re: /^laravel_session$/i, name: "Laravel", category: "Framework", confidence: 90 },
+  { re: /^XSRF-TOKEN$/i, name: "Laravel / Angular", category: "Framework", confidence: 45 },
+  { re: /^JSESSIONID$/i, name: "Java (Servlet/JSP)", category: "Lenguaje/Framework", confidence: 75 },
+  { re: /^connect\.sid$/i, name: "Express.js", category: "Framework", confidence: 85 },
+  { re: /^ASP\.NET_SessionId$/i, name: "ASP.NET", category: "Framework", confidence: 85 },
+  { re: /^\.AspNetCore\./i, name: "ASP.NET Core", category: "Framework", confidence: 85 },
+  { re: /^django_?sessionid$/i, name: "Django", category: "Framework", confidence: 85 },
+  { re: /^csrftoken$/i, name: "Django", category: "Framework", confidence: 50 },
+  { re: /^wordpress_logged_in_/i, name: "WordPress", category: "CMS", confidence: 92 },
+  { re: /^wp-settings-/i, name: "WordPress", category: "CMS", confidence: 85 },
+  { re: /^sails\.sid$/i, name: "Sails.js", category: "Framework", confidence: 85 },
+  { re: /^ci_session$/i, name: "CodeIgniter", category: "Framework", confidence: 80 },
+  { re: /^symfony$/i, name: "Symfony", category: "Framework", confidence: 80 },
+  { re: /^_rails_session$/i, name: "Ruby on Rails", category: "Framework", confidence: 80 },
+];
+
+function analyzeTechFromHeaders(responseHeaderArray) {
+  const findings = [];
+  const headers = headersToObject(responseHeaderArray);
+  for (const rule of TECH_HEADER_RULES) {
+    const value = headers[rule.header];
+    if (value && rule.re.test(value)) {
+      findings.push({ name: rule.name, category: rule.category, confidence: rule.confidence, evidence: `Header ${rule.header}: ${value}` });
+    }
+  }
+  for (const cookieHeader of getAllHeaderValues(responseHeaderArray, "set-cookie")) {
+    const cookieName = (cookieHeader.split("=")[0] || "").trim();
+    if (!cookieName) continue;
+    for (const rule of TECH_COOKIE_RULES) {
+      if (rule.re.test(cookieName)) {
+        findings.push({ name: rule.name, category: rule.category, confidence: rule.confidence, evidence: `Cookie: ${cookieName}` });
+      }
+    }
+  }
+  return findings;
+}
+
+function ensureTechFingerprint(data) {
+  if (!data.techFingerprint) data.techFingerprint = {};
+}
+
+function recordTechFindings(data, findings) {
+  if (!findings || !findings.length) return;
+  ensureTechFingerprint(data);
+  const now = Date.now();
+  for (const f of findings) {
+    const existing = data.techFingerprint[f.name];
+    if (existing) {
+      existing.lastSeen = now;
+      // Confirmado por más de una fuente/señal -> más confianza, con tope
+      existing.confidence = Math.min(99, Math.max(existing.confidence, f.confidence) + (existing.evidence.includes(f.evidence) ? 0 : 3));
+      if (!existing.evidence.includes(f.evidence)) {
+        existing.evidence.push(f.evidence);
+        if (existing.evidence.length > 6) existing.evidence.shift();
+      }
+    } else {
+      data.techFingerprint[f.name] = {
+        name: f.name, category: f.category, confidence: f.confidence,
+        evidence: [f.evidence], firstSeen: now, lastSeen: now,
+      };
+    }
+  }
 }
 
 async function upsertEndpoint(domain, url, method) {
@@ -754,10 +1093,12 @@ ext.webRequest.onHeadersReceived.addListener(
       const contentType = headers["content-type"] || "";
       const corsFindings = analyzeCors(headers, contentType);
       const cspFindings = analyzeCsp(headers, contentType);
-      if (!corsFindings.length && !cspFindings.length) return;
+      const techFindings = analyzeTechFromHeaders(details.responseHeaders);
+      if (!corsFindings.length && !cspFindings.length && !techFindings.length) return;
       const data = await getDomainData(domain);
       for (const f of corsFindings) if (!data.corsFindings.some((x) => x.msg === f.msg)) data.corsFindings.push({ ...f, url: details.url });
       for (const f of cspFindings) if (!data.cspFindings.some((x) => x.msg === f.msg)) data.cspFindings.push({ ...f, url: details.url });
+      recordTechFindings(data, techFindings);
       await saveDomainData(domain, data);
     });
   },
@@ -791,16 +1132,90 @@ ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (decoded) data.jwts.push(decoded);
         }
       }
+      recordTechFindings(data, msg.techSignals);
       await saveDomainData(domain, data);
     }).then(() => sendResponse({ ok: true }));
     return true;
   }
 
   if (msg.type === "shx:netevent") {
-    handleNetEvent(msg);
+    if (msg.source === "websocket") handleWebSocketEvent(msg);
+    else if (msg.source === "techfingerprint") handleTechFingerprintEvent(msg);
+    else handleNetEvent(msg);
     return false;
   }
 });
+
+async function handleTechFingerprintEvent(msg) {
+  const domain = extractDomain(msg.pageUrl || "");
+  if (!domain) return;
+  await withDomainLock(domain, async () => {
+    const data = await getDomainData(domain);
+    recordTechFindings(data, msg.techSignals);
+    await saveDomainData(domain, data);
+  });
+}
+
+// ---- WebSocket: conexiones, mensajes de muestra, y volumen real -----------
+// El interceptor ya throttlea qué se REPORTA (no qué se envía/recibe de
+// verdad), así que acá solo hace falta agregar sin perder la cuenta real:
+// messagesIn/messagesOut suman también los "skippedSinceLastSample" que
+// vienen en cada evento, y las muestras guardadas tienen un tope fijo (no
+// crecen sin límite en una conexión de horas).
+
+const WS_MAX_SAMPLES = 20;
+
+function ensureWebSocketData(data) {
+  if (!data.websockets) data.websockets = {};
+}
+
+async function handleWebSocketEvent(msg) {
+  const domain = extractDomain(msg.url || "");
+  if (!domain) return;
+  const scope = await getScopeConfig();
+
+  await withDomainLock(domain, async () => {
+    const data = await getDomainData(domain);
+    ensureWebSocketData(data);
+
+    const wsKey = (msg.url || "").split("?")[0];
+    if (!data.websockets[wsKey]) {
+      data.websockets[wsKey] = {
+        url: msg.url,
+        firstSeen: Date.now(),
+        lastSeen: Date.now(),
+        connections: 0,
+        messagesIn: 0,
+        messagesOut: 0,
+        sampleMessagesIn: [],
+        sampleMessagesOut: [],
+        lastCloseCode: null,
+        lastCloseReason: null,
+        inScope: isInScope(domain, scope),
+      };
+    }
+    const rec = data.websockets[wsKey];
+    rec.lastSeen = Date.now();
+
+    if (msg.event === "connect") {
+      rec.connections++;
+    } else if (msg.event === "close") {
+      rec.lastCloseCode = msg.code ?? null;
+      rec.lastCloseReason = msg.reason || null;
+    } else if (msg.event === "message_in" || msg.event === "message_out") {
+      const isIn = msg.event === "message_in";
+      const countKey = isIn ? "messagesIn" : "messagesOut";
+      const sampleKey = isIn ? "sampleMessagesIn" : "sampleMessagesOut";
+      rec[countKey] += 1 + (msg.skippedSinceLastSample || 0);
+      if (msg.data) {
+        rec[sampleKey].push({ data: msg.data.slice(0, 500), at: Date.now(), binary: !!msg.binary });
+        if (rec[sampleKey].length > WS_MAX_SAMPLES) rec[sampleKey].shift();
+      }
+    }
+
+    await saveDomainData(domain, data);
+  });
+}
 
 async function handleNetEvent(msg) {
   const domain = extractDomain(msg.url || "");
@@ -869,6 +1284,20 @@ async function handleNetEvent(msg) {
     // Re-scorear candidatos IDOR existentes con las señales nuevas (eco en response)
     if (data.idorCandidates?.length) {
       data.idorCandidates = data.idorCandidates.map((c) => scoreIdorCandidate(c, data)).sort((a, b) => b.score - a.score);
+    }
+
+    // GraphQL: el chequeo barato de substring en looksLikeGraphQLPayload()
+    // descarta la inmensa mayoría de requests JSON normales ANTES de pagar
+    // el costo de un JSON.parse -- solo se parsea de verdad cuando el body
+    // ya contiene el texto '"query"' o '"mutation"'.
+    if (method === "POST" && msg.requestBody) {
+      const gqlOps = parseGraphQLOperations(msg.requestBody);
+      if (gqlOps.length) {
+        recordGraphQLOperations(data, msg.url, method, gqlOps);
+      }
+    }
+    if (msg.responseBody && isIntrospectionResponseConfirmed(msg.responseBody)) {
+      recordGraphQLIntrospection(data, msg.url, msg.responseBody);
     }
 
     await saveDomainData(domain, data);

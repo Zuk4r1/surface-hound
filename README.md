@@ -115,6 +115,47 @@ sugerida con botones **Ver respuesta**, **Ver headers**, **Copiar
 evidencia**, y **Marcar como falso positivo** (queda persistido y
 marcado visualmente, sin borrar el hallazgo).
 
+### ⬡ GraphQL
+Detecta operaciones GraphQL **por la forma del body**, no por la URL (no
+todos los backends usan `/graphql`). Extrae tipo de operación
+(query/mutation/subscription) y nombre, soporta batching (varias
+operaciones en un solo request), y distingue introspection realmente
+confirmada (schema completo visto en una respuesta) de un simple intento
+del lado del cliente. **Cada mutation se marca como candidata a BFLA**
+automáticamente, con un botón que arma la especificación de validación
+(probar con sesión de menor privilegio) — el patrón de GraphQL que casi
+nadie prueba a mano porque no aparece como una ruta REST separada.
+
+Cuando introspection está habilitada, **doble clic en esa tarjeta** expande
+el análisis completo del schema: todas las queries/mutations/subscriptions
+disponibles (no solo las que la app usa — incluye "shadow API"), argumentos
+que parecen identificadores de recurso (candidatos IDOR/BOLA), campos
+deprecados, campos con nombre de dato sensible, enums/inputs/interfaces/
+uniones, y las mutations con nombre de acción destructiva marcadas como
+candidatas prioritarias a revisar autorización.
+
+### 🔌 WebSocket
+Captura conexiones WebSocket completas (chat en vivo, trading,
+notificaciones push) — un blind spot total antes de esta versión, ya que
+solo se hookeaba `fetch`/`XHR`. Muestra conexiones, cierres (código +
+razón), y mensajes entrantes/salientes con **conteo real acumulado**
+(incluye los que el muestreo no guardó como ejemplo) más muestras
+expandibles de texto. El muestreo (máx. 1 mensaje reportado cada 400ms por
+dirección) existe para no saturar el storage con un feed de alto volumen —
+pero nunca afecta el envío/recepción real, solo qué se reporta al panel.
+
+### 🧬 Tecnología
+Fingerprinting 100% pasivo de framework/CMS/servidor/WAF, antes de decidir
+qué payloads probar. Combina tres fuentes que ven cosas distintas: headers
+de respuesta (`Server`, `X-Powered-By`, headers de WAF/CDN) y cookies
+características (`PHPSESSID`, `laravel_session`, `wordpress_logged_in_*`);
+firmas en el DOM (meta generator, rutas como `wp-content`, atributos como
+`ng-version`); y variables JS globales (`window.React`, `window.Vue`,
+`window.__NEXT_DATA__`) — esto último solo se puede ver desde el mundo
+`MAIN` de la página, ninguna otra fuente lo detecta. Si más de una fuente
+corrobora la misma tecnología, la confianza sube en vez de duplicar la
+entrada.
+
 ### 🛡️ Scope
 Definís un programa activo con patrones `allow`/`deny` (admite
 `*.dominio.com`). A partir de ahí, todo lo capturado se marca dentro/fuera
@@ -170,6 +211,7 @@ ejecutarlo desde la extensión. Los jobs corren en cola (varios en
 paralelo), con streaming de salida en vivo y la posibilidad de expandir
 cada uno para ver su resultado completo.
 
+
 ## ⚙️ Instalación
 
 ### 1. Descargar
@@ -222,14 +264,14 @@ manuales adicionales. Recargá la extensión después de instalar el agente.
 4. Revisá **Mapa** para la vista general, **IDOR** para candidatos con
    confianza calculada, **Entidades** para correlaciones entre recursos
 5. Guardá lo que confirmes en **Notas / Reporte** (a mano, o con "Crear
-   hallazgo" desde IDOR) y exportalo en Markdown al terminar la sesión.
+   hallazgo" desde IDOR) y exportalo en Markdown al terminar la sesión
+
 
 ## ⚖️ Licencia y autoría
 
 Ver [LICENSE](./LICENSE). Cualquier redistribución (modificada o no) debe
-mantener la atribución a Zuk4r1 (Yordan Suárez).
+mantener la atribución a Zuk4r1.
 
----
 
 ## ☕ Apoya mis proyectos
 

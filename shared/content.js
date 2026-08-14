@@ -76,6 +76,29 @@
   ];
   const JWT_RE = /eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]*/g;
 
+  // Firmas en el DOM: content.js corre en el mundo AISLADO, que comparte el
+  // DOM con la página (esto SÍ lo puede leer) pero no sus variables JS
+  // globales (window.React, etc. -- eso lo cubre network-interceptor.js,
+  // que corre en el mundo MAIN). Cada test() se ejecuta con su propio
+  // try/catch individual para que un selector raro en una firma puntual no
+  // tumbe la detección de las demás.
+  const DOM_TECH_SIGNATURES = [
+    { test: () => !!document.querySelector('meta[name="generator" i][content*="WordPress" i]'), name: "WordPress", category: "CMS", confidence: 95, evidence: "meta generator" },
+    { test: () => !!document.querySelector('meta[name="generator" i][content*="Drupal" i]'), name: "Drupal", category: "CMS", confidence: 95, evidence: "meta generator" },
+    { test: () => !!document.querySelector('meta[name="generator" i][content*="Joomla" i]'), name: "Joomla", category: "CMS", confidence: 95, evidence: "meta generator" },
+    { test: () => !!document.querySelector('meta[name="generator" i][content*="Wix" i]'), name: "Wix", category: "CMS", confidence: 95, evidence: "meta generator" },
+    { test: () => !!document.querySelector('meta[name="generator" i][content*="Squarespace" i]'), name: "Squarespace", category: "CMS", confidence: 95, evidence: "meta generator" },
+    { test: () => !!document.querySelector('script[src*="wp-content" i], link[href*="wp-content" i], script[src*="wp-includes" i]'), name: "WordPress", category: "CMS", confidence: 85, evidence: "ruta wp-content/wp-includes" },
+    { test: () => !!document.querySelector('[ng-version]'), name: "Angular", category: "Framework frontend", confidence: 90, evidence: "atributo ng-version" },
+    { test: () => !!document.getElementById("__next"), name: "Next.js", category: "Framework frontend", confidence: 85, evidence: "id=__next" },
+    { test: () => !!document.getElementById("__nuxt"), name: "Nuxt.js", category: "Framework frontend", confidence: 85, evidence: "id=__nuxt" },
+    { test: () => !!document.querySelector("[data-reactroot], [data-reactid]"), name: "React", category: "Framework frontend", confidence: 65, evidence: "atributo data-reactroot/data-reactid" },
+    { test: () => !!document.querySelector('script[src*="cdn.shopify.com" i]'), name: "Shopify", category: "E-commerce", confidence: 90, evidence: "script cdn.shopify.com" },
+    { test: () => !!document.querySelector('script[src*="jquery" i]'), name: "jQuery", category: "Librería JS", confidence: 55, evidence: "script src jquery" },
+    { test: () => !!document.querySelector('link[href*="/skin/frontend/" i], script[src*="/skin/frontend/" i]'), name: "Magento", category: "E-commerce", confidence: 85, evidence: "ruta /skin/frontend/" },
+    { test: () => !!document.querySelector('meta[name="generator" i][content*="Hugo" i]'), name: "Hugo", category: "Generador estático", confidence: 90, evidence: "meta generator" },
+  ];
+
   // Claves de ejemplo públicas y bien conocidas (documentación oficial, tutoriales)
   // que NO deben reportarse como hallazgo aunque calcen con el regex.
   const KNOWN_BENIGN_SECRETS = new Set([
@@ -150,7 +173,16 @@
       })
     );
 
-    if (allSecrets.length || allJwts.length) {
+    // Firmas de tecnología en el DOM. Cada una con su propio try/catch para
+    // que un selector raro puntual no tumbe la detección de las demás.
+    const techSignals = [];
+    for (const sig of DOM_TECH_SIGNATURES) {
+      try {
+        if (sig.test()) techSignals.push({ name: sig.name, category: sig.category, confidence: sig.confidence, evidence: sig.evidence });
+      } catch {}
+    }
+
+    if (allSecrets.length || allJwts.length || techSignals.length) {
       // Solo mandamos los tokens crudos: el decodificador vive en background.js
       // (una sola fuente de verdad para los niveles OBSERVED/SUSPICIOUS/CANDIDATE,
       // en vez de mantener dos implementaciones que podrían desincronizarse)
@@ -158,7 +190,8 @@
         type: "shx:findings",
         pageUrl: location.href,
         secrets: allSecrets,
-        jwtTokens: [...new Set(allJwts.map((j) => j.token))]
+        jwtTokens: [...new Set(allJwts.map((j) => j.token))],
+        techSignals,
       });
     }
   }

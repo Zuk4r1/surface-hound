@@ -23,7 +23,7 @@ let nativePort = null;
 let getDomainFn = null;
 let currentMode = "passive"; // passive | assisted | active
 let currentScope = null; // { programName, allow: [], deny: [] } | null (no configurado)
-const expanded = { endpoints: new Set(), params: new Set(), jwt: new Set(), secrets: new Set(), idor: new Set(), treeIds: new Set(), treeNodes: new Set(), responseSample: new Set(), cors: new Set(), corsExtra: new Map() };
+const expanded = { endpoints: new Set(), params: new Set(), jwt: new Set(), secrets: new Set(), idor: new Set(), treeIds: new Set(), treeNodes: new Set(), responseSample: new Set(), cors: new Set(), corsExtra: new Map(), graphql: new Set(), websocket: new Set() };
 
 const STORAGE_PREFIX = "shx:";
 const CONFIG_PREFIX = "shxcfg:";
@@ -222,7 +222,7 @@ function clearPanelError() {
 }
 
 function emptyData(domain) {
-  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], idorCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, dismissedFindings: {} };
+  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], idorCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, dismissedFindings: {}, graphqlOperations: {}, graphqlIntrospection: [], websockets: {}, techFingerprint: {} };
 }
 
 function sevBadge(sev) {
@@ -244,6 +244,9 @@ function render() {
     renderJwt();
     renderSecrets();
     renderCors();
+    renderGraphQL();
+    renderWebSocket();
+    renderTech();
     renderNotes();
   } catch (err) {
     showPanelError(`Error dibujando el panel: ${err.message}`, err.stack);
@@ -893,6 +896,302 @@ function buildCorsEvidenceText(f) {
     `Header:`,
     f.rawHeader || "(sin header capturado)",
   ].join("\n");
+}
+
+// ---- GraphQL: operaciones detectadas + candidatos BFLA + introspection ----
+
+const GQL_TYPE_BADGE = { query: "info", mutation: "high", subscription: "med" };
+
+function buildBflaSpec(op) {
+  return [
+    `Endpoint:`,
+    `${op.method} ${op.endpoint}`,
+    ``,
+    `Operation:`,
+    `${op.operationType} ${op.operationName || "(anónima)"}`,
+    ``,
+    `Suggested test:`,
+    `1. Repetí esta operación con una sesión de un usuario con MENOS privilegios que el actual (o de otro tenant/rol)`,
+    `2. Si igual se ejecuta correctamente (aunque ese usuario no debería poder hacerlo), es un BFLA confirmado`,
+    `3. Probá también sin ningún token de autenticación`,
+    ``,
+    `Required:`,
+    `different authorization context (rol/sesión distinta, o sin sesión)`,
+    ``,
+    `Por qué esta operación es candidata:`,
+    `  - Es una mutation: en GraphQL, la autorización a nivel de operación/campo`,
+    `    se implementa a mano en cada resolver -- es fácil que alguna quede`,
+    `    sin el chequeo, y nadie la prueba manualmente porque no aparece`,
+    `    como una ruta REST separada.`,
+  ].join("\n");
+}
+
+// ---- Análisis del schema completo (mostrado al hacer doble clic en la
+// tarjeta de introspection) -------------------------------------------------
+
+function gqlListSection(title, items, renderItem, emptyText) {
+  if (!items.length) return `<div class="cors-card-section"><div class="hint"><b>${escapeHtml(title)} (0)</b></div>${emptyText ? `<div class="hint" style="font-style:italic">${escapeHtml(emptyText)}</div>` : ""}</div>`;
+  const cap = 15;
+  const visible = items.slice(0, cap);
+  return `<div class="cors-card-section">
+    <div class="hint" style="margin-bottom:4px"><b>${escapeHtml(title)} (${items.length})</b></div>
+    ${visible.map(renderItem).join("")}
+    ${items.length > cap ? `<div class="hint">+${items.length - cap} más</div>` : ""}
+  </div>`;
+}
+
+function renderGraphQLSchemaAnalysis(a) {
+  const fieldRow = (f) => `<div class="mono" style="padding:1px 0">${escapeHtml(f.name)}${f.args?.length ? `(${f.args.map((ar) => `${ar.name}: ${ar.type}`).join(", ")})` : "()"}: ${escapeHtml(f.returnType)}${f.looksPrivileged ? ` <span class="badge high">privilegiada?</span>` : ""}</div>`;
+
+  return `
+    <div class="detail cors-card">
+      <div class="cors-card-section">
+        <div class="hint" style="margin-bottom:4px"><b>Queries (${a.queryFields.length}) vs Mutations (${a.mutationFields.length}) vs Subscriptions (${a.subscriptionFields.length})</b></div>
+      </div>
+      <div class="cors-card-divider"></div>
+      ${gqlListSection("Queries disponibles", a.queryFields, fieldRow)}
+      <div class="cors-card-divider"></div>
+      ${gqlListSection("Mutations disponibles", a.mutationFields, fieldRow, "Sin mutations en el schema.")}
+      ${a.subscriptionFields.length ? `<div class="cors-card-divider"></div>${gqlListSection("Subscriptions disponibles", a.subscriptionFields, fieldRow)}` : ""}
+      <div class="cors-card-divider"></div>
+      ${gqlListSection(
+        "Argumentos interesantes (candidatos IDOR/BOLA)",
+        a.interestingArgs,
+        (arg) => `<div class="mono" style="padding:1px 0">${escapeHtml(arg.typeName)}.${escapeHtml(arg.fieldName)}(<span style="color:var(--crit)">${escapeHtml(arg.argName)}: ${escapeHtml(arg.argType)}</span>)</div>`,
+        "Sin argumentos tipo ID detectados."
+      )}
+      <div class="cors-card-divider"></div>
+      ${gqlListSection(
+        "Campos deprecados",
+        a.deprecatedFields,
+        (f) => `<div class="mono" style="padding:1px 0">${escapeHtml(f.typeName)}.${escapeHtml(f.fieldName)}${f.reason ? ` <span class="hint">— ${escapeHtml(f.reason)}</span>` : ""}</div>`,
+        "Sin campos deprecados en el schema."
+      )}
+      <div class="cors-card-divider"></div>
+      ${gqlListSection(
+        "Posibles campos sensibles",
+        a.sensitiveFields,
+        (f) => `<div class="mono" style="padding:1px 0">${sevBadge("medium")} ${escapeHtml(f.typeName)}.${escapeHtml(f.fieldName)}</div>`,
+        "Sin nombres de campo que sugieran datos sensibles."
+      )}
+      <div class="cors-card-divider"></div>
+      ${gqlListSection(
+        "Enums",
+        a.enums,
+        (e) => `<div class="mono" style="padding:1px 0">${escapeHtml(e.name)}: ${e.values.map(escapeHtml).join(" | ")}</div>`
+      )}
+      <div class="cors-card-divider"></div>
+      ${gqlListSection(
+        "Inputs",
+        a.inputs,
+        (inp) => `<div class="mono" style="padding:1px 0">${escapeHtml(inp.name)} { ${inp.fields.map((f) => `${escapeHtml(f.name)}: ${escapeHtml(f.type)}`).join(", ")} }</div>`
+      )}
+      <div class="cors-card-divider"></div>
+      ${gqlListSection(
+        "Interfaces",
+        a.interfaces,
+        (i) => `<div class="mono" style="padding:1px 0">${escapeHtml(i.name)} (${i.possibleTypesCount} tipos posibles)</div>`
+      )}
+      ${a.unions.length ? `<div class="cors-card-divider"></div>${gqlListSection("Unions", a.unions, (u) => `<div class="mono" style="padding:1px 0">${escapeHtml(u.name)} = ${u.possibleTypes.map(escapeHtml).join(" | ")}</div>`)}` : ""}
+      <div class="cors-card-divider"></div>
+      <div class="cors-card-footer hint">
+        <b>Análisis de autorización:</b> las mutations marcadas "privilegiada?" tienen nombre de acción destructiva/administrativa
+        (delete/ban/grant/promote/etc.) — son las primeras candidatas a probar BFLA, incluso si la UI de la app nunca las llama:
+        el schema las expone igual si introspection está habilitada.
+      </div>
+    </div>
+  `;
+}
+
+// ---- WebSocket: conexiones detectadas, volumen real, muestras de mensajes -
+
+// ---- Fingerprinting de tecnología: headers, cookies, DOM y globales JS ----
+
+function renderTech() {
+  const el = document.getElementById("tech-list");
+  if (!el) return;
+  const techs = Object.values(currentData.techFingerprint || {});
+  if (!techs.length) {
+    el.innerHTML = `<div class="empty">Sin tecnología detectada aún.</div>`;
+    return;
+  }
+
+  const byCategory = {};
+  for (const t of techs) {
+    if (!byCategory[t.category]) byCategory[t.category] = [];
+    byCategory[t.category].push(t);
+  }
+
+  const confBadge = (c) => (c >= 85 ? "high" : c >= 60 ? "med" : "info");
+
+  el.innerHTML = Object.entries(byCategory)
+    .sort(([, a], [, b]) => Math.max(...b.map((t) => t.confidence)) - Math.max(...a.map((t) => t.confidence)))
+    .map(([category, items]) => `
+      <div class="detail-block" style="margin-bottom:12px">
+        <b>${escapeHtml(category)}</b>
+        ${items
+          .sort((a, b) => b.confidence - a.confidence)
+          .map(
+            (t) => `<div class="row" style="margin-top:6px">
+              <span class="badge ${confBadge(t.confidence)}">${t.confidence}%</span> <b>${escapeHtml(t.name)}</b>
+              <div class="hint" style="margin-top:2px">${t.evidence.map(escapeHtml).join(" · ")}</div>
+            </div>`
+          )
+          .join("")}
+      </div>
+    `)
+    .join("");
+}
+
+function renderWebSocket() {
+  const el = document.getElementById("websocket-list");
+  if (!el) return;
+  const conns = Object.entries(currentData.websockets || {});
+  if (!conns.length) {
+    el.innerHTML = `<div class="empty">Sin conexiones WebSocket detectadas aún.</div>`;
+    return;
+  }
+
+  el.innerHTML = conns
+    .map(([key, ws]) => {
+      const isOpen = expanded.websocket?.has(key);
+      const isClosed = ws.lastCloseCode != null;
+      const outOfScope = ws.inScope === false;
+      return `<div class="row ${outOfScope ? "out-of-scope" : ""}">
+        <div class="row-head" data-ws-key="${escapeHtml(key)}" style="cursor:pointer;display:flex;justify-content:space-between">
+          <span>
+            <span class="badge ${isClosed ? "med" : "info"}">${isClosed ? "cerrada" : "activa/observada"}</span>
+            <b class="mono">${escapeHtml(ws.url)}</b>
+            ${outOfScope ? `<span class="badge critical">fuera de scope</span>` : ""}
+          </span>
+          <span class="hint">${isOpen ? "▲" : "▼"}</span>
+        </div>
+        <div class="hint">conexiones: ${ws.connections} · mensajes recibidos: ${ws.messagesIn} · mensajes enviados: ${ws.messagesOut} · último: ${new Date(ws.lastSeen).toLocaleTimeString()}</div>
+        ${isClosed ? `<div class="hint">último cierre: código ${ws.lastCloseCode}${ws.lastCloseReason ? ` — ${escapeHtml(ws.lastCloseReason)}` : ""}</div>` : ""}
+        ${isOpen ? `
+          <div class="detail">
+            <div class="detail-block">
+              <b>Muestras de mensajes recibidos (últimas ${ws.sampleMessagesIn.length} de ${ws.messagesIn} reales)</b>
+              ${ws.sampleMessagesIn.length ? ws.sampleMessagesIn.slice().reverse().map((m) => `<pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;margin-top:4px">${m.binary ? "[binario] " : ""}${escapeHtml(m.data)}</pre>`).join("") : `<div class="hint">Sin muestras de texto capturadas todavía.</div>`}
+            </div>
+            <div class="detail-block">
+              <b>Muestras de mensajes enviados (últimas ${ws.sampleMessagesOut.length} de ${ws.messagesOut} reales)</b>
+              ${ws.sampleMessagesOut.length ? ws.sampleMessagesOut.slice().reverse().map((m) => `<pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;margin-top:4px">${m.binary ? "[binario] " : ""}${escapeHtml(m.data)}</pre>`).join("") : `<div class="hint">Sin muestras de texto capturadas todavía.</div>`}
+            </div>
+          </div>
+        ` : ""}
+      </div>`;
+    })
+    .join("");
+
+  el.querySelectorAll(".row-head[data-ws-key]").forEach((head) => {
+    head.addEventListener("click", () => {
+      const key = head.dataset.wsKey;
+      expanded.websocket = expanded.websocket || new Set();
+      expanded.websocket.has(key) ? expanded.websocket.delete(key) : expanded.websocket.add(key);
+      renderWebSocket();
+    });
+  });
+}
+
+function renderGraphQL() {
+  const introEl = document.getElementById("graphql-introspection-list");
+  const listEl = document.getElementById("graphql-list");
+  if (!introEl || !listEl) return;
+
+  const introspection = currentData.graphqlIntrospection || [];
+  introEl.innerHTML = introspection.length
+    ? introspection.map((f, i) => {
+        const key = `intro:${f.url}`;
+        const isOpen = expanded.graphql?.has(key);
+        const a = f.schemaAnalysis;
+        return `
+      <div class="row">
+        <div class="row-head" data-gql-key="${escapeHtml(key)}" style="cursor:pointer;display:flex;justify-content:space-between">
+          <span>${sevBadge(f.severity)} <b>Introspection habilitada</b> · Confianza: ${f.confidence}%${a ? ` · ${a.totalTypes} tipos en el schema` : ""}</span>
+          <span class="hint">${a ? (isOpen ? "▲" : "▼ doble clic para ver el schema") : ""}</span>
+        </div>
+        <div class="hint mono" style="margin-top:4px">${escapeHtml(f.url)}</div>
+        <div class="hint" style="margin-top:4px">${escapeHtml(f.note)}</div>
+        ${isOpen && a ? renderGraphQLSchemaAnalysis(a) : ""}
+        ${isOpen && !a ? `<div class="hint" style="margin-top:8px;font-style:italic">No se pudo parsear el schema completo de esta respuesta (puede estar truncada).</div>` : ""}
+      </div>
+    `;
+      }).join("")
+    : "";
+
+  introEl.querySelectorAll(".row-head[data-gql-key]").forEach((head) => {
+    head.addEventListener("dblclick", () => {
+      const key = head.dataset.gqlKey;
+      expanded.graphql = expanded.graphql || new Set();
+      expanded.graphql.has(key) ? expanded.graphql.delete(key) : expanded.graphql.add(key);
+      renderGraphQL();
+    });
+  });
+
+  const ops = Object.entries(currentData.graphqlOperations || {});
+  if (!ops.length) {
+    listEl.innerHTML = introspection.length ? "" : `<div class="empty">Sin operaciones GraphQL detectadas aún.</div>`;
+    return;
+  }
+
+  // mutations primero (son las candidatas a BFLA, lo más accionable)
+  const sorted = ops.sort(([, a], [, b]) => {
+    if (a.operationType === "mutation" && b.operationType !== "mutation") return -1;
+    if (b.operationType === "mutation" && a.operationType !== "mutation") return 1;
+    return b.hits - a.hits;
+  });
+
+  listEl.innerHTML = sorted
+    .map(([key, op]) => {
+      const isOpen = expanded.graphql?.has(key);
+      const isMutation = op.operationType === "mutation";
+      return `<div class="row">
+        <div class="row-head" data-gql-key="${escapeHtml(key)}" style="cursor:pointer;display:flex;justify-content:space-between">
+          <span>
+            <span class="badge ${GQL_TYPE_BADGE[op.operationType] || "info"}">${escapeHtml(op.operationType)}</span>
+            <b>${escapeHtml(op.operationName || "(anónima)")}</b>
+            ${isMutation ? `<span class="badge high" title="Autorización a nivel de operación -- rara vez se prueba a mano">BFLA candidate</span>` : ""}
+            ${op.introspectionRequested ? `<span class="badge med">introspection solicitada</span>` : ""}
+          </span>
+          <span class="hint">${isOpen ? "▲" : "▼"}</span>
+        </div>
+        <div class="hint mono">${escapeHtml(op.method)} ${escapeHtml(op.endpoint)}</div>
+        <div class="hint">visto ${op.hits}x · último: ${new Date(op.lastSeen).toLocaleTimeString()}</div>
+        ${isMutation && isOpen ? `
+          <div class="detail">
+            <pre class="mono" style="background:var(--bg);padding:8px;border-radius:4px;overflow-x:auto">${escapeHtml(buildBflaSpec(op))}</pre>
+            <div class="detail-actions">
+              <button class="btn-gql-copy" data-gql-key="${escapeHtml(key)}">Copiar</button>
+            </div>
+          </div>
+        ` : ""}
+      </div>`;
+    })
+    .join("");
+
+  expanded.graphql = expanded.graphql || new Set();
+
+  listEl.querySelectorAll(".row-head[data-gql-key]").forEach((head) => {
+    head.addEventListener("click", () => {
+      const key = head.dataset.gqlKey;
+      expanded.graphql.has(key) ? expanded.graphql.delete(key) : expanded.graphql.add(key);
+      renderGraphQL();
+    });
+  });
+
+  listEl.querySelectorAll(".btn-gql-copy").forEach((btn) => {
+    btn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const key = btn.dataset.gqlKey;
+      const op = currentData.graphqlOperations[key];
+      try {
+        await navigator.clipboard.writeText(buildBflaSpec(op));
+        btn.textContent = "Copiado ✓";
+        setTimeout(() => (btn.textContent = "Copiar"), 1500);
+      } catch {}
+    });
+  });
 }
 
 function renderCors() {
