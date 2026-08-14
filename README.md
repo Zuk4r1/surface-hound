@@ -270,7 +270,7 @@ manuales adicionales. Recargá la extensión después de instalar el agente.
 ## ⚖️ Licencia y autoría
 
 Ver [LICENSE](./LICENSE). Cualquier redistribución (modificada o no) debe
-mantener la atribución a Zuk4r1.
+mantener la atribución a **Zuk4r1**.
 
 
 ## ☕ Apoya mis proyectos
