@@ -5,7 +5,7 @@ vivo durante bug bounty**, con un puente opcional hacia tus herramientas
 CLI locales (nuclei, httpx, katana, arjun, dalfox, ffuf, dnsx, gau,
 subfinder).
 
-Creada por **Zuk4r1 (Yordan Suárez)**. Ver [LICENSE](./LICENSE) para
+Creada por **Zuk4r1**. Ver [LICENSE](./LICENSE) para
 términos de atribución y uso.
 
 > Uso exclusivo en programas autorizados: VDP, Bug Bounty, pentest
