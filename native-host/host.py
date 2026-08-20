@@ -27,10 +27,12 @@ import threading
 import uuid
 import queue
 import time
+import tempfile
+import os
 
 ALLOWED_ACTIONS = {
     "nuclei":    ["nuclei", "-u", "{target}", "-silent", "-timeout", "8"],
-    "arjun":     ["arjun", "-u", "{target}", "-oT", "/tmp/surfacehound_arjun_out.txt"],
+    "arjun":     ["arjun", "-u", "{target}", "-oT", "{extra_output_file}"],
     "dalfox":    ["dalfox", "url", "{target}", "--silence"],
     "gau":       ["gau", "{target_host}"],
     "ffuf":      ["ffuf", "-u", "{target}/FUZZ", "-w", "/usr/share/seclists/Discovery/Web-Content/common.txt", "-s"],
@@ -154,55 +156,134 @@ def run_job(job_id):
             return
 
         scope = job.get("scope")
-        if scope:
-            in_scope = is_in_scope(host, scope)
+        # Antes: si no llegaba scope (job.get("scope") vacío/None), este
+        # bloque entero se saltaba -- y aunque llegara un scope con
+        # allow=[] vacío, is_in_scope() devuelve None, que tampoco disparaba
+        # el bloqueo (solo se bloqueaba con is False explícito). Fail-open
+        # en dos caminos distintos, no uno: mismo problema real que se
+        # corrigió del lado de la extensión, y con las mismas consecuencias
+        # acá -- este es el proceso que EJECUTA de verdad los comandos, así
+        # que confiar en que "sin scope = permitido" es más grave todavía
+        # que en la UI. Ahora solo se ejecuta si in_scope es explícitamente
+        # True; cualquier otro estado (False, o None por scope ausente/vacío)
+        # bloquea.
+        in_scope = is_in_scope(host, scope)
+        if in_scope is not True:
             if in_scope is False:
-                finish_job(job_id, ok=False, error=f"BLOQUEADO por scope guard: {host} no está permitido ({scope.get('programName', 'programa sin nombre')})", blocked=True)
-                return
-
-        cmd_template = ALLOWED_ACTIONS[action]
-        cmd = [c.replace("{target}", target).replace("{target_host}", host) for c in cmd_template]
-
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        except FileNotFoundError:
-            finish_job(job_id, ok=False, error=f"herramienta '{cmd[0]}' no encontrada en PATH")
+                reason = f"{host} no está permitido ({scope.get('programName', 'programa sin nombre')})"
+            else:
+                reason = "no hay scope configurado (o está vacío) -- por seguridad, se bloquea cualquier ejecución sin un scope activo con al menos un patrón 'allow'"
+            finish_job(job_id, ok=False, error=f"BLOQUEADO por scope guard: {reason}", blocked=True)
             return
 
-        with jobs_lock:
-            job["process"] = proc
+        cmd_template = ALLOWED_ACTIONS[action]
 
-        timeout = TOOL_TIMEOUTS.get(action, DEFAULT_TIMEOUT)
-        timer = threading.Timer(timeout, lambda: proc.poll() is None and proc.kill())
-        timer.start()
-        truncated = False
-        line_count = 0
+        # arjun escribe sus resultados REALES a un archivo (-oT) en vez de
+        # stdout -- antes esa ruta era fija y compartida
+        # (/tmp/surfacehound_arjun_out.txt), lo que traía dos problemas
+        # reales, no uno: (1) inseguro (CWE-377, archivo temporal
+        # predecible): en un sistema multiusuario, otra cuenta podría
+        # pre-crear un symlink ahí apuntando a un archivo sensible del
+        # usuario, y arjun lo sobreescribiría sin darse cuenta al "seguirlo";
+        # (2) funcional -- el agente soporta hasta MAX_CONCURRENT jobs en
+        # paralelo, así que dos corridas de arjun a la vez pisaban el
+        # resultado la una de la otra en la misma ruta. Y además, ese
+        # archivo nunca se leía de vuelta -- el usuario jamás veía los
+        # parámetros que arjun realmente encontraba, solo lo que imprimía
+        # por stdout (que con -oT no es el resultado real).
+        # tempfile.mkstemp() crea un archivo único e impredecible por job,
+        # de forma atómica (evita la carrera del symlink), y ahora sí se lee
+        # su contenido al terminar y se limpia siempre, pase lo que pase.
+        extra_output_file = None
+        if action == "arjun":
+            fd, extra_output_file = tempfile.mkstemp(prefix="surfacehound_arjun_", suffix=".txt")
+            os.close(fd)
+
         try:
-            for line in proc.stdout:
-                line_count += 1
-                if line_count > MAX_OUTPUT_LINES:
-                    truncated = True
-                    proc.kill()
-                    break
-                send_message({"job_id": job_id, "line": line.rstrip("\n")})
-                with jobs_lock:
-                    if job["status"] == "cancelled":
-                        break
-            proc.wait()
-        finally:
-            timer.cancel()
+            cmd = [
+                c.replace("{target}", target)
+                 .replace("{target_host}", host)
+                 .replace("{extra_output_file}", extra_output_file or "")
+                for c in cmd_template
+            ]
 
-        if truncated:
-            send_message({"job_id": job_id, "line": f"[cortado: se superaron {MAX_OUTPUT_LINES} líneas de salida]"})
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            except FileNotFoundError:
+                finish_job(job_id, ok=False, error=f"herramienta '{cmd[0]}' no encontrada en PATH")
+                return
 
-        with jobs_lock:
-            cancelled = job["status"] == "cancelled"
-        if not cancelled:
-            finish_job(job_id, ok=True, returncode=proc.returncode)
-        else:
             with jobs_lock:
-                job["finishedAt"] = time.time()
-            send_message({"job_id": job_id, "ok": True, "done": True, "cancelled": True, "returncode": proc.returncode})
+                job["process"] = proc
+
+            timeout = TOOL_TIMEOUTS.get(action, DEFAULT_TIMEOUT)
+            timer = threading.Timer(timeout, lambda: proc.poll() is None and proc.kill())
+            timer.start()
+            truncated = False
+            line_count = 0
+            try:
+                for line in proc.stdout:
+                    line_count += 1
+                    if line_count > MAX_OUTPUT_LINES:
+                        truncated = True
+                        proc.kill()
+                        break
+                    send_message({"job_id": job_id, "line": line.rstrip("\n")})
+                    with jobs_lock:
+                        if job["status"] == "cancelled":
+                            break
+                proc.wait()
+            finally:
+                timer.cancel()
+
+            if truncated:
+                send_message({"job_id": job_id, "line": f"[cortado: se superaron {MAX_OUTPUT_LINES} líneas de salida]"})
+
+            # Leer de vuelta el archivo de arjun -oT y mandarlo como líneas
+            # de salida más -- así el resultado real llega al usuario, no
+            # solo lo que arjun haya impreso por stdout. La limpieza pasa
+            # ACÁ, inmediatamente después de leer y ANTES de reportar "done"
+            # -- si se limpiara después de mandar el mensaje de finalización
+            # (como estaba antes), una terminación abrupta del proceso justo
+            # en esa ventana (el navegador cerrando la extensión, por
+            # ejemplo) podía dejar el archivo huérfano; ahora, para cuando
+            # el cliente se entera de que terminó, la limpieza ya ocurrió.
+            # El finally de más abajo queda como red de seguridad extra para
+            # cualquier camino de excepción no contemplado acá.
+            if extra_output_file and os.path.exists(extra_output_file):
+                try:
+                    with open(extra_output_file, "r", errors="replace") as f:
+                        extra_content = f.read().strip()
+                    if extra_content:
+                        send_message({"job_id": job_id, "line": "--- Parámetros encontrados (arjun -oT) ---"})
+                        for out_line in extra_content.splitlines():
+                            send_message({"job_id": job_id, "line": out_line})
+                except OSError as e:
+                    send_message({"job_id": job_id, "line": f"[no se pudo leer el archivo de salida de arjun: {e}]"})
+                finally:
+                    try:
+                        os.remove(extra_output_file)
+                    except OSError:
+                        pass
+                    extra_output_file = None  # ya se limpió -- que el finally externo no lo intente de nuevo
+
+            with jobs_lock:
+                cancelled = job["status"] == "cancelled"
+            if not cancelled:
+                finish_job(job_id, ok=True, returncode=proc.returncode)
+            else:
+                with jobs_lock:
+                    job["finishedAt"] = time.time()
+                send_message({"job_id": job_id, "ok": True, "done": True, "cancelled": True, "returncode": proc.returncode})
+        finally:
+            # Limpieza garantizada del temporal de arjun sin importar qué
+            # pasó arriba (éxito, cancelado, timeout, o el proceso ni
+            # siquiera llegó a arrancar) -- nunca queda basura en /tmp.
+            if extra_output_file:
+                try:
+                    os.remove(extra_output_file)
+                except OSError:
+                    pass
 
     finally:
         with running_count_lock:

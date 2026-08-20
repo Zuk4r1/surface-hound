@@ -23,7 +23,7 @@ let nativePort = null;
 let getDomainFn = null;
 let currentMode = "passive"; // passive | assisted | active
 let currentScope = null; // { programName, allow: [], deny: [] } | null (no configurado)
-const expanded = { endpoints: new Set(), params: new Set(), jwt: new Set(), secrets: new Set(), idor: new Set(), treeIds: new Set(), treeNodes: new Set(), responseSample: new Set(), cors: new Set(), corsExtra: new Map(), graphql: new Set(), websocket: new Set() };
+const expanded = { endpoints: new Set(), params: new Set(), jwt: new Set(), secrets: new Set(), idor: new Set(), treeIds: new Set(), treeNodes: new Set(), responseSample: new Set(), cors: new Set(), corsExtra: new Map(), graphql: new Set(), websocket: new Set(), sourcemaps: new Set() };
 
 const STORAGE_PREFIX = "shx:";
 const CONFIG_PREFIX = "shxcfg:";
@@ -65,8 +65,21 @@ function checkActiveActionAllowed(targetUrl) {
   const host = hostnameOf(targetUrl);
   if (!host) return "URL inválida.";
   const inScope = isInScope(host, currentScope);
-  if (inScope === false) {
-    return `⚠ OUT OF SCOPE\n\nRecurso fuera del scope configurado (${escapeHtml(host)}).\n\nAnálisis pasivo: permitido\nPruebas activas: bloqueadas`;
+  // Antes: solo se bloqueaba si inScope === false (fuera de scope
+  // explícitamente). Cuando no había NINGÚN scope configurado, isInScope()
+  // devuelve null -- y null !== false, así que nada se bloqueaba: fail-open.
+  // Con el puente a un agente nativo capaz de ejecutar comandos reales
+  // contra un target, "sin scope configurado" NO debería equivaler a "todo
+  // permitido" -- es exactamente el escenario donde un olvido humano (subir
+  // a modo Activo sin haber configurado el Scope todavía) termina generando
+  // tráfico activo o ejecutando herramientas contra un objetivo por
+  // accidente. Ahora solo se permite cuando inScope es explícitamente true;
+  // cualquier otro estado (false o null) bloquea, fail-closed.
+  if (inScope !== true) {
+    if (inScope === false) {
+      return `⚠ FUERA DE SCOPE\n\nRecurso fuera del scope configurado (${escapeHtml(host)}).\n\nAnálisis pasivo: permitido\nPruebas activas: bloqueadas`;
+    }
+    return `⚠ SIN SCOPE CONFIGURADO\n\nPor seguridad, las acciones activas están bloqueadas hasta que definas un scope en la pestaña "Scope" (allow con al menos un patrón). Sin esto, no hay forma de distinguir un objetivo autorizado de uno que no lo es.\n\nAnálisis pasivo: permitido\nPruebas activas: bloqueadas`;
   }
   return null;
 }
@@ -151,7 +164,7 @@ function renderStatusLine() {
     <span>SCOPE: <b style="color:${scopeOn ? "var(--low)" : "var(--muted)"}">${scopeOn ? "ON" : "OFF"}</b>${scopeOn ? ` (${escapeHtml(currentScope.programName || "sin nombre")})` : ""}</span>
     <span class="hint">·</span>
     <span>AGENT: <b style="color:${agentColor}">${agentLabel}</b></span>
-    <span style="margin-left:auto;color:var(--accent);text-shadow:var(--glow)">🕵️‍♂️ Zuk4r1 (Yordan Suárez)</span>
+    <span style="margin-left:auto;color:var(--accent);text-shadow:var(--glow)">🕵️‍♂️ Zuk4r1</span>
   `;
 }
 
@@ -222,7 +235,80 @@ function clearPanelError() {
 }
 
 function emptyData(domain) {
-  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], idorCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, dismissedFindings: {}, graphqlOperations: {}, graphqlIntrospection: [], websockets: {}, techFingerprint: {} };
+  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], securityHeaderFindings: [], oauthFlows: {}, oauthFindings: [], idorCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, entitySeenInResponse: {}, reflectedValues: {}, dismissedFindings: {}, graphqlOperations: {}, graphqlIntrospection: [], websockets: {}, techFingerprint: {}, sourceMaps: {} };
+}
+
+// ---- Severidad multi-plataforma: traducción de nuestra escala interna
+// (Critical/High/Medium/Low/Informational) a las etiquetas reales que usa
+// cada plataforma -- útil al armar el reporte final, porque "High" no
+// significa lo mismo en todos lados (Bugcrowd usa su propia taxonomía de
+// prioridad P1-P5, no CVSS directo).
+const SEVERITY_PLATFORM_MAP = {
+  Critical: { hackerone: "Critical", bugcrowd: "P1 — Critical", intigriti: "Critical", cvss: "9.0–10.0" },
+  High: { hackerone: "High", bugcrowd: "P2 — High", intigriti: "High", cvss: "7.0–8.9" },
+  Medium: { hackerone: "Medium", bugcrowd: "P3 — Medium", intigriti: "Medium", cvss: "4.0–6.9" },
+  Low: { hackerone: "Low", bugcrowd: "P4 — Low", intigriti: "Low", cvss: "0.1–3.9" },
+  Informational: { hackerone: "None", bugcrowd: "P5 — Informational", intigriti: "None", cvss: "0.0" },
+};
+
+function severityPlatformLine(severity) {
+  const m = SEVERITY_PLATFORM_MAP[severity];
+  if (!m) return null;
+  return `HackerOne: ${m.hackerone} · Bugcrowd: ${m.bugcrowd} · Intigriti: ${m.intigriti} · CVSS aprox.: ${m.cvss}`;
+}
+
+// ---- Checklist explícito de "qué falta demostrar" por tipo de hallazgo,
+// en vez de un texto genérico repetido en todos lados. Cada tipo tiene sus
+// propios pasos reales de validación -- lo que hace falta confirmar para
+// un IDOR no es lo mismo que para un BFLA de GraphQL o un CORS crítico.
+const VALIDATION_CHECKLISTS = {
+  idor: [
+    "Probado con sesión de otro usuario (no admin, no la propia)",
+    "Confirmado acceso a datos que no pertenecen al usuario que hizo el request",
+    "Descartado que sea un recurso público intencional (perfil público, contenido compartido a propósito)",
+    "Confirmado que el ID no es simplemente uno ya visto antes con la sesión propia",
+  ],
+  bfla: [
+    "Probado con sesión de un usuario con rol/tenant de menor privilegio",
+    "Probado sin ningún token de autenticación",
+    "Confirmado que la operación realmente se ejecutó (no solo devolvió 200 con un error interno)",
+  ],
+  cors_critical: [
+    "Confirmado con un header Origin arbitrario real (no solo observado pasivamente)",
+    "Confirmado que el navegador de verdad acepta la respuesta (no la bloquea pese al header)",
+    "Identificado un endpoint autenticado con datos sensibles alcanzable con esta configuración",
+  ],
+  oauth_state: [
+    "Armado el flujo CSRF completo (link de inicio de sesión iniciado por el atacante)",
+    "Confirmado que el proveedor no valida el origen de otra forma (ej. cookie de sesión previa)",
+    "Confirmado el impacto real (vinculación de cuenta, fijación de sesión, etc.)",
+  ],
+  oauth_pkce: [
+    "Confirmado que el cliente es público (SPA/app móvil, sin client_secret seguro)",
+    "Probado interceptar/reutilizar el authorization code desde otro contexto",
+    "Confirmado que el intercambio del code no exige ningún otro factor además del code mismo",
+  ],
+  sourcemap_secret: [
+    "Confirmado que el secreto sigue activo (no rotado/revocado)",
+    "Confirmado el alcance real de la clave (permisos concretos, no solo que existe)",
+    "Descartado que sea una clave de entorno de pruebas o pública por diseño",
+  ],
+  rate_limit: [
+    "Probado activamente el umbral real (no solo tráfico normal que nunca lo alcanzó)",
+    "Confirmado que no hay throttling a nivel de IP/cuenta que no se vio en la sesión normal",
+    "Evaluado el impacto real según el tipo de endpoint (OTP de pocos dígitos es mucho más grave que contraseña)",
+  ],
+  csp_generic: [
+    "Identificado un punto de inyección real (reflejo de input del usuario en el HTML)",
+    "Confirmado que la directiva relajada (unsafe-inline/unsafe-eval) es explotable desde ese punto de inyección",
+    "Probado un payload concreto, no solo la configuración en abstracto",
+  ],
+};
+
+function buildValidationChecklist(kind) {
+  const items = VALIDATION_CHECKLISTS[kind];
+  if (!items) return "";
+  return items.map((i) => `☐ ${i}`).join("\n");
 }
 
 function sevBadge(sev) {
@@ -237,16 +323,19 @@ function escapeHtml(str) {
 function render() {
   try {
     renderMapa();
+    renderRateLimitFindings();
     renderEndpoints();
     renderParams();
     renderIdor();
     renderEntidades();
     renderJwt();
+    renderSourceMaps();
     renderSecrets();
     renderCors();
     renderGraphQL();
     renderWebSocket();
     renderTech();
+    renderChains();
     renderNotes();
   } catch (err) {
     showPanelError(`Error dibujando el panel: ${err.message}`, err.stack);
@@ -438,6 +527,37 @@ function renderEntidades() {
 
 // ---- Endpoints: clic para expandir y ver params/CORS/CSP asociados + acciones ----
 
+// ---- Ausencia de rate limiting en endpoints sensibles (inferido pasivamente:
+// mismo endpoint pegado varias veces, nunca un 429) -----------------------
+
+const SENSITIVE_AUTH_PATH_RE = /\/(login|signin|sign-in|log-in|auth|authenticate|otp|verify(-otp)?|verification|2fa|mfa|reset-password|resetpassword|forgot-password|forgotpassword|password-reset|change-password)(\/|\?|$)/i;
+const RATE_LIMIT_HIT_THRESHOLD = 5;
+
+function renderRateLimitFindings() {
+  const el = document.getElementById("ratelimit-list");
+  if (!el) return;
+  const candidates = Object.values(currentData.endpoints || {}).filter((e) => {
+    if (e.hits < RATE_LIMIT_HIT_THRESHOLD || e.saw429) return false;
+    let path = "";
+    try { path = new URL(e.url).pathname; } catch { return false; }
+    return SENSITIVE_AUTH_PATH_RE.test(path);
+  });
+  if (!candidates.length) return (el.innerHTML = "");
+
+  el.innerHTML = `<div class="detail-block">
+    <b>Posible ausencia de rate limiting (${candidates.length})</b>
+    <div class="hint" style="margin-bottom:6px">Endpoints sensibles (login/OTP/reset) vistos ${RATE_LIMIT_HIT_THRESHOLD}+ veces sin haber recibido nunca un HTTP 429. No confirma la ausencia -- solo que no se observó throttling en el tráfico normal capturado hasta ahora.</div>
+    ${candidates
+      .map(
+        (e) => `<div class="row">
+          ${sevBadge("medium")} <span class="mono">${escapeHtml(e.method)} ${escapeHtml(e.url)}</span>
+          <div class="hint" style="margin-top:2px">visto ${e.hits}x, sin 429 en ninguna</div>
+        </div>`
+      )
+      .join("")}
+  </div>`;
+}
+
 function renderEndpoints() {
   const el = document.getElementById("endpoints-list");
   const entries = Object.values(currentData.endpoints || {}).sort((a, b) => b.lastSeen - a.lastSeen);
@@ -447,7 +567,7 @@ function renderEndpoints() {
     .map((e) => {
       const isOpen = expanded.endpoints.has(e.url + e.method);
       const relatedParams = getParamsInUrl(e.url);
-      const relatedCors = [...(currentData.corsFindings || []), ...(currentData.cspFindings || [])].filter((f) => f.url === e.url);
+      const relatedCors = [...(currentData.corsFindings || []), ...(currentData.cspFindings || []), ...(currentData.securityHeaderFindings || []), ...(currentData.oauthFindings || [])].filter((f) => f.url === e.url);
       const outOfScope = e.inScope === false;
       const sampleKey = e.url + e.method + "::sample";
       const sampleOpen = expanded.responseSample.has(sampleKey);
@@ -681,6 +801,9 @@ function buildTestSpec(c) {
     ``,
     `Signals that motivated this test:`,
     ...(c.signals || []).map((s) => `  - ${s}`),
+    ``,
+    `Qué falta demostrar:`,
+    buildValidationChecklist("idor"),
   ].join("\n");
 }
 
@@ -854,6 +977,153 @@ function renderJwt() {
   });
 }
 
+// ---- Source maps: detección pasiva (siempre) + verificación activa (un clic,
+// gateada por modo y Scope Guard, igual que "Probar CORS ahora") ----------
+
+// Subconjunto compacto y de ALTA confianza -- no busca replicar la lista
+// completa de patrones de content.js (que corre en otro contexto/mundo
+// aislado). El objetivo acá es específico: si el código fuente original
+// completo queda expuesto vía sourcesContent, ¿aparece alguna de las
+// señales de mayor valor entre las que ya usamos en el resto de la
+// extensión?
+const SOURCEMAP_SECRET_PATTERNS = [
+  { name: "AWS Access Key ID", re: /AKIA[0-9A-Z]{16}/g },
+  { name: "Private Key block", re: /-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----/g },
+  { name: "Stripe Secret Key", re: /sk_live_[0-9a-zA-Z]{24,}/g },
+  { name: "GitHub Token", re: /gh[pousr]_[A-Za-z0-9]{36,}/g },
+];
+
+function scanSourceMapContentForSecrets(text) {
+  const found = [];
+  for (const p of SOURCEMAP_SECRET_PATTERNS) {
+    const matches = text.match(p.re);
+    if (matches?.length) found.push({ name: p.name, count: new Set(matches).size });
+  }
+  return found;
+}
+
+async function verifySourceMap(mapUrl) {
+  const blocked = checkActiveActionAllowed(mapUrl);
+  if (blocked) return { error: blocked };
+  try {
+    const res = await fetch(mapUrl, { credentials: "include" });
+    if (!res.ok) return { accessible: false };
+    const text = await res.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      return { accessible: false }; // 200 pero no es un mapa válido -- no cuenta como expuesto de verdad
+    }
+    if (!json || !Array.isArray(json.sources)) return { accessible: false };
+
+    const hasSourcesContent = Array.isArray(json.sourcesContent) && json.sourcesContent.some((c) => typeof c === "string" && c.length > 0);
+    let endpointsFound = [];
+    let secretsFound = [];
+    if (hasSourcesContent) {
+      // Tope de 300.000 caracteres para el escaneo -- un mapa de un bundle
+      // grande puede traer megabytes de sourcesContent; no hace falta leerlo
+      // entero para encontrar endpoints/secretos, y evita bloquear el panel.
+      const combined = json.sourcesContent.filter((c) => typeof c === "string").join("\n").slice(0, 300000);
+      endpointsFound = [...new Set(combined.match(/https?:\/\/[a-zA-Z0-9.\-]+(?:\/[^\s"'`)]*)?/g) || [])].slice(0, 30);
+      secretsFound = scanSourceMapContentForSecrets(combined);
+    }
+    return {
+      accessible: true,
+      sourcesCount: json.sources.length,
+      hasSourcesContent,
+      sampleSourcePaths: json.sources.slice(0, 30),
+      endpointsFound,
+      secretsFound,
+    };
+  } catch (e) {
+    return { accessible: false, error: e.message };
+  }
+}
+
+function renderSourceMaps() {
+  const el = document.getElementById("sourcemaps-list");
+  if (!el) return;
+  const maps = Object.values(currentData.sourceMaps || {});
+  if (!maps.length) return (el.innerHTML = "");
+
+  el.innerHTML = `<div class="detail-block">
+    <b>Source maps referenciados (${maps.length})</b>
+    <div class="hint" style="margin-bottom:6px">Detectados pasivamente por el comentario "//# sourceMappingURL=" al final de cada script. Verificar si de verdad están expuestos es una acción activa (requiere modo Asistido/Activo).</div>
+    ${maps
+      .map((m, i) => {
+        const key = m.mapUrl;
+        const isOpen = expanded.sourcemaps?.has(key);
+        return `<div class="row">
+          <div class="row-head" data-smap-key="${escapeHtml(key)}" style="cursor:pointer;display:flex;justify-content:space-between">
+            <span>
+              ${m.verified ? (m.accessible ? sevBadge(m.hasSourcesContent ? "high" : "medium") : `<span class="badge low">no accesible</span>`) : `<span class="badge info">sin verificar</span>`}
+              <b class="mono">${escapeHtml(m.mapUrl)}</b>
+            </span>
+            <span class="hint">${isOpen ? "▲" : "▼"}</span>
+          </div>
+          <div class="hint">script: <span class="mono">${escapeHtml(m.scriptUrl)}</span></div>
+          ${isOpen ? `
+            <div class="detail">
+              ${!m.verified ? `
+                <button class="btn-verify-smap" data-smap-idx="${i}" ${currentMode === "passive" ? "disabled title='Cambia a modo Asistido o Activo'" : ""}>Verificar exposición</button>
+                <div class="smap-verify-result hint" data-smap-idx="${i}" style="margin-top:6px"></div>
+              ` : m.accessible ? `
+                <div class="detail-block">
+                  <div class="hint"><b>Accesible:</b> sí · ${m.sourcesCount} archivo(s) de código fuente revelados</div>
+                  <div class="hint" style="margin-top:4px"><b>sourcesContent (código fuente completo, no solo nombres):</b> ${m.hasSourcesContent ? "presente" : "ausente"}</div>
+                  ${m.sampleSourcePaths?.length ? `
+                    <div class="hint" style="margin-top:6px"><b>Rutas reveladas (muestra):</b></div>
+                    <pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;max-height:180px;overflow-y:auto">${m.sampleSourcePaths.map(escapeHtml).join("\n")}</pre>
+                  ` : ""}
+                  ${m.endpointsFound?.length ? `
+                    <div class="hint" style="margin-top:6px"><b>Endpoints encontrados en el código fuente:</b></div>
+                    <pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;max-height:180px;overflow-y:auto">${m.endpointsFound.map(escapeHtml).join("\n")}</pre>
+                  ` : ""}
+                  ${m.secretsFound?.length ? `
+                    <div class="hint" style="margin-top:6px;color:var(--crit)"><b>⚠ Posibles secretos en el código fuente:</b></div>
+                    ${m.secretsFound.map((s) => `<div class="hint">${sevBadge("critical")} ${escapeHtml(s.name)} (${s.count} ocurrencia(s))</div>`).join("")}
+                  ` : ""}
+                </div>
+              ` : `<div class="hint">No se pudo acceder al mapa (bloqueado, 404, o no es un source map válido).</div>`}
+            </div>
+          ` : ""}
+        </div>`;
+      })
+      .join("")}
+  </div>`;
+
+  expanded.sourcemaps = expanded.sourcemaps || new Set();
+
+  el.querySelectorAll(".row-head[data-smap-key]").forEach((head) => {
+    head.addEventListener("click", () => {
+      const key = head.dataset.smapKey;
+      expanded.sourcemaps.has(key) ? expanded.sourcemaps.delete(key) : expanded.sourcemaps.add(key);
+      renderSourceMaps();
+    });
+  });
+
+  el.querySelectorAll(".btn-verify-smap").forEach((btn) => {
+    btn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const idx = Number(btn.dataset.smapIdx);
+      const mapUrl = maps[idx].mapUrl;
+      const resultEl = el.querySelector(`.smap-verify-result[data-smap-idx="${idx}"]`);
+      btn.disabled = true;
+      resultEl.textContent = "Verificando…";
+      const result = await verifySourceMap(mapUrl);
+      if (result.error) {
+        resultEl.innerHTML = `<div class="scope-warning">${escapeHtml(result.error)}</div>`;
+        btn.disabled = false;
+        return;
+      }
+      currentData.sourceMaps[mapUrl] = { ...currentData.sourceMaps[mapUrl], verified: true, ...result };
+      await saveCurrent();
+      renderSourceMaps();
+    });
+  });
+}
+
 function renderSecrets() {
   const el = document.getElementById("secrets-list");
   const entries = [...(currentData.secrets || [])].sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
@@ -879,6 +1149,14 @@ function renderSecrets() {
 }
 
 const SEVERITY_IMPACT = { critical: "ALTO", high: "ALTO", medium: "MODERADO", low: "BAJO", info: "BAJO" };
+
+function checklistKeyForFinding(f) {
+  if (f.type === "CORS" && f.severity === "critical") return "cors_critical";
+  if (f.type === "CSP") return "csp_generic";
+  if (f.type === "OAuth/OIDC" && f.directive === "state") return "oauth_state";
+  if (f.type === "OAuth/OIDC" && f.directive?.includes("PKCE")) return "oauth_pkce";
+  return null;
+}
 
 function corsFindingKey(f) {
   return `${f.type}:${f.directive}:${f.url}:${f.msg}`;
@@ -923,6 +1201,9 @@ function buildBflaSpec(op) {
     `    se implementa a mano en cada resolver -- es fácil que alguna quede`,
     `    sin el chequeo, y nadie la prueba manualmente porque no aparece`,
     `    como una ruta REST separada.`,
+    ``,
+    `Qué falta demostrar:`,
+    buildValidationChecklist("bfla"),
   ].join("\n");
 }
 
@@ -1006,6 +1287,98 @@ function renderGraphQLSchemaAnalysis(a) {
 // ---- WebSocket: conexiones detectadas, volumen real, muestras de mensajes -
 
 // ---- Fingerprinting de tecnología: headers, cookies, DOM y globales JS ----
+
+// ---- Cadenas de explotación sugeridas: cruza datos que ya existen en
+// distintas pestañas (nunca ejecuta nada nuevo, solo lee currentData) para
+// sugerir combinaciones que valen la pena probar juntas, no aisladas. Cada
+// regla exige DOS señales concretas presentes en la misma sesión, no una
+// sola -- evita generar "cadenas" a partir de una única pista débil.
+
+function computeSuggestedChains(data) {
+  const chains = [];
+
+  const ssrfParams = Object.entries(data.params || {}).filter(([, v]) => (v.hits || []).some((h) => h.name === "SSRF"));
+  const awsSecret = (data.secrets || []).find((s) => /aws/i.test(s.name) && !s.byDesignPublic);
+  if (ssrfParams.length && awsSecret) {
+    chains.push({
+      title: "SSRF hacia metadata de instancia + credenciales AWS ya vistas",
+      severity: "high",
+      description: `Parámetro candidato a SSRF (${ssrfParams.map(([p]) => p).join(", ")}) y por separado una clave AWS expuesta ("${awsSecret.name}") en esta misma sesión. Si el SSRF alcanza 169.254.169.254 (metadata de instancia), podría obtenerse un rol IAM adicional al de la clave ya encontrada — vale la pena probar ambos vectores juntos.`,
+    });
+  }
+
+  const corsCritical = (data.corsFindings || []).find((f) => f.severity === "critical");
+  const hasAuthEndpoint = Object.values(data.endpoints || {}).some((e) => e.hasAuth);
+  if (corsCritical && hasAuthEndpoint) {
+    chains.push({
+      title: "CORS permisivo con credenciales + endpoints autenticados existentes",
+      severity: "high",
+      description: "Se observó ACAO: * combinado con Allow-Credentials: true. Si se confirma que el navegador realmente lo acepta, un sitio de terceros podría leer las respuestas de los endpoints autenticados ya capturados en esta sesión, sin necesitar robar la sesión de otra forma.",
+    });
+  }
+
+  const idorHigh = (data.idorCandidates || []).find((c) => c.level === "HIGH");
+  const highlyCorrelated = Object.entries(data.entityGraph?.edges || {}).find(([, edges]) => Object.keys(edges).length >= 2);
+  if (idorHigh && highlyCorrelated) {
+    chains.push({
+      title: "IDOR de alta confianza + entidad correlacionada con múltiples recursos",
+      severity: "high",
+      description: `El candidato IDOR en "${idorHigh.template}" tiene confianza alta, y por separado "${highlyCorrelated[0]}" está correlacionado con ${Object.keys(highlyCorrelated[1]).length} otras entidades distintas (ver pestaña Entidades). Si el IDOR se confirma, podría dar acceso en cascada a los recursos correlacionados, no solo al que se prueba directamente.`,
+    });
+  }
+
+  const hasMutation = Object.values(data.graphqlOperations || {}).some((op) => op.operationType === "mutation");
+  const weakJwt = (data.jwts || []).find((j) => j.maxTier === "CANDIDATE");
+  if (hasMutation && weakJwt) {
+    chains.push({
+      title: "Mutation GraphQL + JWT con hallazgo de nivel CANDIDATE",
+      severity: "medium",
+      description: "Se vio al menos una mutation GraphQL y, por separado, un JWT con hallazgos de nivel CANDIDATE (ver pestaña JWT). Si el JWT puede forjarse o manipularse, la mutation podría ejecutarse con un rol distinto al propio — confirmar el JWT primero suele ser el paso más corto para escalar desde acá.",
+    });
+  }
+
+  const smapWithSecrets = Object.values(data.sourceMaps || {}).find((m) => (m.secretsFound || []).length > 0);
+  if (smapWithSecrets) {
+    chains.push({
+      title: "Source map expuesto con secretos confirmados dentro",
+      severity: "high",
+      description: `El source map de ${smapWithSecrets.scriptUrl} reveló código fuente completo con posibles secretos (${smapWithSecrets.secretsFound.map((s) => s.name).join(", ")}). Vale la pena revisar a mano el resto del código fuente revelado (pestaña Secretos) — suelen aparecer más credenciales o endpoints internos cerca del mismo archivo.`,
+    });
+  }
+
+  const pkceFinding = (data.oauthFindings || []).find((f) => f.directive?.includes("PKCE"));
+  const openRedirectParam = Object.entries(data.params || {}).find(([, v]) => (v.hits || []).some((h) => h.name === "Open Redirect"));
+  if (pkceFinding && openRedirectParam) {
+    chains.push({
+      title: "OAuth sin PKCE + candidato a Open Redirect en el mismo dominio",
+      severity: "high",
+      description: `El flujo OAuth no usa PKCE, y por separado se detectó un parámetro candidato a Open Redirect ("${openRedirectParam[0]}"). Si el Open Redirect se confirma, podría desviar el código de autorización a un dominio propio — sin PKCE, ese código interceptado alcanza para canjearlo por un token.`,
+    });
+  }
+
+  return chains;
+}
+
+function renderChains() {
+  const el = document.getElementById("chains-list");
+  if (!el) return;
+  const chains = computeSuggestedChains(currentData);
+  if (!chains.length) {
+    el.innerHTML = `<div class="empty">Sin cadenas sugeridas todavía — hacen falta al menos dos señales relacionadas en la misma sesión (ej. un SSRF candidato + un secreto AWS, o un IDOR de alta confianza + una entidad correlacionada).</div>`;
+    return;
+  }
+  el.innerHTML = chains
+    .map(
+      (c) => `<div class="row">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start">
+          <b>${escapeHtml(c.title)}</b>
+          ${sevBadge(c.severity)}
+        </div>
+        <div class="hint" style="margin-top:6px">${escapeHtml(c.description)}</div>
+      </div>`
+    )
+    .join("");
+}
 
 function renderTech() {
   const el = document.getElementById("tech-list");
@@ -1196,7 +1569,7 @@ function renderGraphQL() {
 
 function renderCors() {
   const el = document.getElementById("cors-list");
-  const all = [...(currentData.corsFindings || []), ...(currentData.cspFindings || [])];
+  const all = [...(currentData.corsFindings || []), ...(currentData.cspFindings || []), ...(currentData.securityHeaderFindings || []), ...(currentData.oauthFindings || [])];
   if (!all.length) return (el.innerHTML = `<div class="empty">Sin hallazgos CORS/CSP aún.</div>`);
   const dismissed = currentData.dismissedFindings || {};
 
@@ -1260,7 +1633,14 @@ function renderCors() {
             <div class="cors-card-divider"></div>
             <div class="cors-card-footer hint">
               Impacto potencial: <b>${SEVERITY_IMPACT[f.severity] || "BAJO"}</b> · Confianza: <b>${escapeHtml(f.confidence || "?")}</b> · Estado: <b>REQUIERE VALIDACIÓN</b>
-              <div style="margin-top:4px;font-style:italic">"Se encuentra una configuración CORS/CSP que merece revisión."</div>
+              ${(() => {
+                const checklistKey = checklistKeyForFinding(f);
+                const checklist = checklistKey ? buildValidationChecklist(checklistKey) : "";
+                if (checklist) {
+                  return `<div style="margin-top:6px"><b>Qué falta demostrar:</b></div><pre class="mono" style="margin-top:2px;white-space:pre-wrap">${escapeHtml(checklist)}</pre>`;
+                }
+                return `<div style="margin-top:4px;font-style:italic">"Se encuentra una configuración que merece revisión."</div>`;
+              })()}
             </div>
           </div>
         ` : ""}
@@ -1327,13 +1707,15 @@ function renderNotes() {
   const notes = currentData.notes || [];
   if (!notes.length) return (el.innerHTML = `<div class="empty">Sin hallazgos guardados aún.</div>`);
   el.innerHTML = notes
-    .map(
-      (n) => `<div class="row">
+    .map((n) => {
+      const platformLine = severityPlatformLine(n.severity);
+      return `<div class="row">
       <span class="title">${escapeHtml(n.title)}</span> ${sevBadge(n.severity)}
+      ${platformLine ? `<div class="hint" style="margin-top:2px">${escapeHtml(platformLine)}</div>` : ""}
       <div style="white-space:pre-wrap;margin-top:4px">${escapeHtml(n.body)}</div>
       <div class="hint">${new Date(n.createdAt).toLocaleString()}</div>
-    </div>`
-    )
+    </div>`;
+    })
     .join("");
 }
 
@@ -1412,14 +1794,15 @@ document.getElementById("export").addEventListener("click", async () => {
 
 function buildReport() {
   const notes = currentData.notes || [];
-  const footer = `\n---\n\n_Generado con Surface Hound — creado por Zuk4r1 (Yordan Suárez)._\n`;
+  const footer = `\n---\n\n_Generado con Surface Hound — creado por Zuk4r1._\n`;
   let md = `# Reporte de Bug Bounty — ${currentDomain}\n\n`;
   if (!notes.length) {
     md += "_Sin hallazgos guardados. Agrega notas en la pestaña Notas/Reporte._\n";
     return md + footer;
   }
   for (const n of notes) {
-    md += `## ${n.title}\n\n**Severity:** ${n.severity}\n\n**Summary / Steps to reproduce / Impact:**\n\n${n.body}\n\n---\n\n`;
+    const platformLine = severityPlatformLine(n.severity);
+    md += `## ${n.title}\n\n**Severity:** ${n.severity}${platformLine ? `\n\n**Traducción por plataforma:** ${platformLine}` : ""}\n\n**Summary / Steps to reproduce / Impact:**\n\n${n.body}\n\n---\n\n`;
   }
   return md + footer;
 }
@@ -1446,7 +1829,12 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
 // "nombre_herramienta → url" que no dice nada sobre qué hace la herramienta.
 const CLI_COMMAND_TEMPLATES = {
   nuclei: (t, h) => `nuclei -u ${t} -silent -timeout 8`,
-  arjun: (t, h) => `arjun -u ${t} -oT /tmp/surfacehound_arjun_out.txt`,
+  // El agente genera un archivo temporal único e impredecible por job (no
+  // una ruta fija) -- acá no se puede saber el nombre exacto de antemano,
+  // así que se muestra el patrón real en vez de una ruta que induciría a
+  // error. Los resultados de ese archivo se leen de vuelta automáticamente
+  // y se muestran como parte de la salida del job.
+  arjun: (t, h) => `arjun -u ${t} -oT <archivo temporal único, se lee de vuelta automáticamente>`,
   dalfox: (t, h) => `dalfox url ${t} --silence`,
   gau: (t, h) => `gau ${h}`,
   ffuf: (t, h) => `ffuf -u ${t}/FUZZ -w /usr/share/seclists/Discovery/Web-Content/common.txt -s`,

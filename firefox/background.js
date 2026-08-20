@@ -145,6 +145,20 @@ const PARAM_RULES = [
   }
 ];
 
+// El objetivo que se está investigando controla libremente los nombres de
+// sus propios parámetros de URL -- eso incluye, en principio, "__proto__",
+// "constructor" o "prototype". Ninguna regla de PARAM_RULES matchea esos
+// nombres literalmente hoy, así que no es explotable en la práctica ahora
+// mismo -- pero esa protección es implícita (depende de que ninguna regla
+// futura los matchee por accidente) y no una barrera real. Cualquier string
+// que vaya a usarse como clave dinámica de un objeto (bracket assignment)
+// debería pasar por este chequeo explícito primero, sin importar si hoy
+// parece alcanzable o no.
+const DANGEROUS_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+function isSafeObjectKey(key) {
+  return typeof key === "string" && !DANGEROUS_OBJECT_KEYS.has(key);
+}
+
 function classifyParams(paramNames) {
   const results = {};
   for (const p of paramNames) {
@@ -795,6 +809,168 @@ function analyzeCsp(headers, contentType) {
   return findings;
 }
 
+// ---- Headers de seguridad básicos (HSTS, X-Frame-Options,
+// X-Content-Type-Options, Permissions-Policy) -- reconocimiento estándar,
+// más allá de CORS/CSP, que cualquier hunter chequea de entrada. Mismo
+// principio que CSP: "ausente" solo se reporta sobre el documento HTML
+// principal, no sobre cada asset/respuesta de API, para no generar ruido.
+// ---- OAuth/OIDC: análisis del flujo de autorización, no solo del JWT
+// resultante -- redirect_uri sin validar, state ausente (CSRF), PKCE
+// ausente. Se detecta por la FORMA de los query params (client_id +
+// redirect_uri + response_type juntos), no por una ruta fija, porque cada
+// proveedor usa una URL distinta para su endpoint de autorización.
+
+function analyzeOAuthRequest(url) {
+  let params;
+  try {
+    params = new URL(url).searchParams;
+  } catch {
+    return null;
+  }
+  const clientId = params.get("client_id");
+  const redirectUri = params.get("redirect_uri");
+  const responseType = params.get("response_type");
+  if (!clientId || !redirectUri || !responseType) return null; // no es un request de autorización OAuth
+
+  const state = params.get("state");
+  const codeChallenge = params.get("code_challenge");
+  const codeChallengeMethod = params.get("code_challenge_method");
+  const scope = params.get("scope");
+  const nonce = params.get("nonce");
+
+  const rawHeader = `client_id=${clientId}\nredirect_uri=${redirectUri}\nresponse_type=${responseType}${scope ? `\nscope=${scope}` : ""}`;
+  const findings = [];
+
+  if (!state) {
+    findings.push({
+      severity: "high", type: "OAuth/OIDC", directive: "state", observedValue: "(ausente)", confidence: "ALTA", rawHeader,
+      msg: "Parámetro 'state' ausente en la solicitud de autorización.",
+      whyItMatters: "Sin 'state', el flujo OAuth es vulnerable a CSRF: un atacante puede iniciar su propio flujo de autorización e inducir a la víctima a completarlo, vinculando la cuenta de la víctima a la sesión/cuenta del atacante en el proveedor externo. Confirmar requiere armar el flujo CSRF completo."
+    });
+  }
+  if (!codeChallenge && responseType === "code") {
+    findings.push({
+      severity: "medium", type: "OAuth/OIDC", directive: "code_challenge (PKCE)", observedValue: "(ausente)", confidence: "MEDIA", rawHeader,
+      msg: "PKCE ausente (sin 'code_challenge') en un flujo de tipo 'code'.",
+      whyItMatters: "Sin PKCE, si el 'authorization code' es interceptado (otra app en el mismo dispositivo con el mismo redirect_uri, un log, un proxy) puede canjearse por un token sin necesitar el client_secret -- especialmente relevante en clientes públicos (SPA, apps móviles) que no pueden guardar un secreto de forma segura."
+    });
+  }
+  if (responseType === "token" || responseType === "id_token") {
+    findings.push({
+      severity: "medium", type: "OAuth/OIDC", directive: "response_type", observedValue: responseType, confidence: "ALTA", rawHeader,
+      msg: `Flujo implícito detectado (response_type=${responseType}).`,
+      whyItMatters: "El flujo implícito devuelve el token directamente en el fragmento de la URL sin canjear un 'code' -- queda expuesto en el historial del navegador, en logs de proxies intermedios, y vía el header Referer si la página de destino carga recursos externos. OAuth 2.1 lo deprecó a favor de Authorization Code + PKCE."
+    });
+  }
+  findings.push({
+    severity: "info", type: "OAuth/OIDC", directive: "redirect_uri", observedValue: redirectUri, confidence: "BAJA", rawHeader,
+    msg: `redirect_uri observado: ${redirectUri}`,
+    whyItMatters: "Probá modificar este parámetro (subdominios, path traversal, '@' en la URL, doble encoding) para ver si el servidor de autorización valida estrictamente contra una whitelist exacta o acepta variantes -- un redirect_uri manipulable permite robar el code/token redirigiendo la respuesta a un dominio propio. Esto es una hipótesis a validar activamente, no un hallazgo confirmado."
+  });
+
+  return {
+    flow: { clientId, redirectUri, responseType, scope: scope || null, nonceObserved: !!nonce, stateObserved: !!state, pkceObserved: !!codeChallenge, codeChallengeMethod: codeChallengeMethod || null },
+    findings,
+  };
+}
+
+function ensureOAuthData(data) {
+  if (!data.oauthFlows) data.oauthFlows = {};
+  if (!data.oauthFindings) data.oauthFindings = [];
+}
+
+function recordOAuthFlow(data, url) {
+  const analysis = analyzeOAuthRequest(url);
+  if (!analysis) return;
+  ensureOAuthData(data);
+  const key = `${analysis.flow.clientId}::${analysis.flow.redirectUri}`;
+  const now = Date.now();
+  if (!data.oauthFlows[key]) {
+    data.oauthFlows[key] = { ...analysis.flow, firstSeen: now, lastSeen: now, hits: 1 };
+  } else {
+    const rec = data.oauthFlows[key];
+    rec.lastSeen = now;
+    rec.hits++;
+    // si en algún request posterior SÍ aparece state/PKCE, no lo pisamos a "ausente" de nuevo
+    rec.stateObserved = rec.stateObserved || analysis.flow.stateObserved;
+    rec.pkceObserved = rec.pkceObserved || analysis.flow.pkceObserved;
+  }
+  for (const f of analysis.findings) {
+    if (!data.oauthFindings.some((x) => x.msg === f.msg)) data.oauthFindings.push({ ...f, url });
+  }
+}
+
+function analyzeSecurityHeaders(headers, contentType, url) {
+  const findings = [];
+  const isDocument = !contentType || /text\/html/i.test(contentType);
+  if (!isDocument) return findings;
+
+  // HSTS solo tiene sentido evaluarlo sobre HTTPS -- sobre HTTP puro
+  // todavía no aplica (el navegador ni siquiera lo procesaría).
+  let isHttps = false;
+  try { isHttps = new URL(url).protocol === "https:"; } catch {}
+  const hsts = headers["strict-transport-security"];
+  if (isHttps && !hsts) {
+    findings.push({
+      severity: "low", type: "Security Header", directive: "Strict-Transport-Security",
+      observedValue: "(ausente)", confidence: "ALTA", rawHeader: "(sin header Strict-Transport-Security)",
+      msg: "Sin header Strict-Transport-Security (HSTS).",
+      whyItMatters: "Sin HSTS, un usuario que escriba la URL sin https:// (o siga un link http://) puede quedar expuesto a un downgrade a HTTP antes de la redirección -- condición que habilita ataques de intermediario tipo SSL stripping en redes no confiables. No es una vulnerabilidad confirmada por sí sola, depende del escenario de red del usuario."
+    });
+  } else if (isHttps && hsts) {
+    const maxAgeMatch = hsts.match(/max-age=(\d+)/i);
+    const maxAge = maxAgeMatch ? parseInt(maxAgeMatch[1], 10) : 0;
+    if (maxAge > 0 && maxAge < 15552000) { // menos de ~180 días, valor mínimo recomendado habitual
+      const humanReadable = maxAge < 86400 ? `${Math.round(maxAge / 3600)} hora(s)` : `${Math.round(maxAge / 86400)} día(s)`;
+      findings.push({
+        severity: "info", type: "Security Header", directive: "Strict-Transport-Security",
+        observedValue: hsts, confidence: "MEDIA", rawHeader: `Strict-Transport-Security: ${hsts}`,
+        msg: `HSTS presente pero con max-age bajo (${maxAge}s, ${humanReadable}).`,
+        whyItMatters: "Un max-age corto reduce la ventana real de protección de HSTS -- si el header deja de enviarse por un error de despliegue o una CDN mal configurada, la protección expira rápido en vez de mantenerse por meses."
+      });
+    }
+  }
+
+  // X-Frame-Options: la directiva frame-ancestors de CSP puede cumplir el
+  // mismo rol y es más moderna -- si CSP ya la trae, no tiene sentido
+  // reportar la ausencia de X-Frame-Options como si nada la cubriera.
+  const csp = headers["content-security-policy"] || "";
+  const hasFrameAncestors = /frame-ancestors/i.test(csp);
+  const xfo = headers["x-frame-options"];
+  if (!xfo && !hasFrameAncestors) {
+    findings.push({
+      severity: "medium", type: "Security Header", directive: "X-Frame-Options / CSP frame-ancestors",
+      observedValue: "(ausente)", confidence: "MEDIA", rawHeader: "(sin X-Frame-Options ni frame-ancestors en CSP)",
+      msg: "Sin X-Frame-Options ni CSP frame-ancestors.",
+      whyItMatters: "Sin ninguno de los dos, la página puede embeberse en un <iframe> de un sitio de terceros -- condición necesaria (no suficiente) para clickjacking. Hace falta un flujo de UI sensible (cambio de contraseña, transferencia, autorización OAuth) para que esto sea explotable de verdad; requiere armar la prueba de concepto con un iframe real."
+    });
+  }
+
+  // X-Content-Type-Options
+  const xcto = headers["x-content-type-options"];
+  if (!xcto || !/nosniff/i.test(xcto)) {
+    findings.push({
+      severity: "low", type: "Security Header", directive: "X-Content-Type-Options",
+      observedValue: xcto || "(ausente)", confidence: "ALTA",
+      rawHeader: xcto ? `X-Content-Type-Options: ${xcto}` : "(sin header X-Content-Type-Options)",
+      msg: "Sin X-Content-Type-Options: nosniff.",
+      whyItMatters: "Sin 'nosniff', el navegador puede intentar adivinar el tipo de contenido en vez de respetar el Content-Type declarado -- relevante sobre todo si el sitio sirve contenido subido por usuarios (avatares, adjuntos) desde el mismo origen, donde MIME-sniffing puede habilitar XSS almacenado en escenarios específicos."
+    });
+  }
+
+  // Permissions-Policy
+  if (!headers["permissions-policy"]) {
+    findings.push({
+      severity: "info", type: "Security Header", directive: "Permissions-Policy",
+      observedValue: "(ausente)", confidence: "ALTA", rawHeader: "(sin header Permissions-Policy)",
+      msg: "Sin header Permissions-Policy.",
+      whyItMatters: "Sin Permissions-Policy, no hay restricción explícita sobre qué APIs del navegador (cámara, micrófono, geolocalización, USB, etc.) puede usar la página o un iframe de terceros embebido en ella. Es una capa de mitigación ausente, no una vulnerabilidad confirmada por sí sola."
+    });
+  }
+
+  return findings;
+}
+
 // ---- Storage --------------------------------------------------------------
 
 function domainKey(domain) {
@@ -822,7 +998,11 @@ async function getDomainData(domain) {
       graphqlOperations: {},
       graphqlIntrospection: [],
       websockets: {},
-      techFingerprint: {}
+      techFingerprint: {},
+      sourceMaps: {},
+      securityHeaderFindings: [],
+      oauthFlows: {},
+      oauthFindings: []
     }
   );
 }
@@ -957,6 +1137,44 @@ function analyzeTechFromHeaders(responseHeaderArray) {
   return findings;
 }
 
+// ---- Source maps: referencias detectadas pasivamente (la verificación real
+// -- descargar el .map y ver si de verdad expone código fuente -- es una
+// acción activa que vive en el panel, gateada por Scope Guard igual que
+// "Probar CORS ahora") --------------------------------------------------
+
+function ensureSourceMapsData(data) {
+  if (!data.sourceMaps) data.sourceMaps = {};
+}
+
+function recordSourceMapReferences(data, refs) {
+  if (!refs || !refs.length) return;
+  ensureSourceMapsData(data);
+  const now = Date.now();
+  for (const ref of refs) {
+    if (!ref || !ref.mapUrl) continue;
+    if (!data.sourceMaps[ref.mapUrl]) {
+      data.sourceMaps[ref.mapUrl] = {
+        scriptUrl: ref.scriptUrl,
+        mapUrl: ref.mapUrl,
+        firstSeen: now,
+        lastSeen: now,
+        // Estos campos se llenan solo cuando el usuario hace clic en
+        // "Verificar exposición" en el panel -- hasta entonces, esto es
+        // únicamente "se referencia un mapa", no "está confirmado expuesto".
+        verified: false,
+        accessible: null,
+        sourcesCount: null,
+        hasSourcesContent: null,
+        sampleSourcePaths: [],
+        endpointsFound: [],
+        secretsFound: [],
+      };
+    } else {
+      data.sourceMaps[ref.mapUrl].lastSeen = now;
+    }
+  }
+}
+
 function ensureTechFingerprint(data) {
   if (!data.techFingerprint) data.techFingerprint = {};
 }
@@ -1001,7 +1219,9 @@ async function upsertEndpoint(domain, url, method) {
 
     const params = extractParamsFromUrl(url);
     const classified = classifyParams(params);
+    recordOAuthFlow(data, url);
     for (const [param, hits] of Object.entries(classified)) {
+      if (!isSafeObjectKey(param)) continue; // ver DANGEROUS_OBJECT_KEYS más arriba
       if (!data.params[param]) data.params[param] = { hits, sources: [] };
       if (!data.params[param].sources.includes(url) && data.params[param].sources.length < 8) {
         data.params[param].sources.push(url);
@@ -1093,12 +1313,24 @@ ext.webRequest.onHeadersReceived.addListener(
       const contentType = headers["content-type"] || "";
       const corsFindings = analyzeCors(headers, contentType);
       const cspFindings = analyzeCsp(headers, contentType);
+      const securityHeaderFindings = analyzeSecurityHeaders(headers, contentType, details.url);
       const techFindings = analyzeTechFromHeaders(details.responseHeaders);
-      if (!corsFindings.length && !cspFindings.length && !techFindings.length) return;
+      // details.statusCode está disponible acá para CUALQUIER request (no
+      // solo fetch/XHR, a diferencia de handleNetEvent) -- por eso el
+      // rastreo de "alguna vez vimos un 429 en este endpoint" vive acá, no
+      // en el otro listener, que se pierde requests de navegación/formularios.
+      const is429 = details.statusCode === 429;
+      if (!corsFindings.length && !cspFindings.length && !securityHeaderFindings.length && !techFindings.length && !is429) return;
       const data = await getDomainData(domain);
+      if (!data.securityHeaderFindings) data.securityHeaderFindings = [];
       for (const f of corsFindings) if (!data.corsFindings.some((x) => x.msg === f.msg)) data.corsFindings.push({ ...f, url: details.url });
       for (const f of cspFindings) if (!data.cspFindings.some((x) => x.msg === f.msg)) data.cspFindings.push({ ...f, url: details.url });
+      for (const f of securityHeaderFindings) if (!data.securityHeaderFindings.some((x) => x.msg === f.msg)) data.securityHeaderFindings.push({ ...f, url: details.url });
       recordTechFindings(data, techFindings);
+      if (is429) {
+        const epKey = `${(details.method || "GET").toUpperCase()} ${details.url.split("?")[0]}`;
+        if (data.endpoints[epKey]) data.endpoints[epKey].saw429 = true;
+      }
       await saveDomainData(domain, data);
     });
   },
@@ -1133,6 +1365,7 @@ ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
       }
       recordTechFindings(data, msg.techSignals);
+      recordSourceMapReferences(data, msg.sourceMaps);
       await saveDomainData(domain, data);
     }).then(() => sendResponse({ ok: true }));
     return true;

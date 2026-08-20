@@ -76,6 +76,29 @@
   ];
   const JWT_RE = /eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]*/g;
 
+  // Detección de source maps referenciados: por convención, el comentario
+  // "//# sourceMappingURL=..." (o su variante de bloque /*# ... */) siempre
+  // va al FINAL del archivo -- por eso solo se busca en la cola (últimos
+  // 500 caracteres), no en el texto completo del bundle, que puede pesar
+  // cientos de KB. Cero costo de red extra: se reutiliza el mismo fetch que
+  // ya se hace para buscar secretos, solo se lee un poco más del texto que
+  // ya está en memoria.
+  const SOURCEMAP_COMMENT_RE = /\/[\/*]#\s*sourceMappingURL=\s*(\S+?)\s*(?:\*\/)?\s*$/;
+
+  function detectSourceMapReference(text, scriptUrl) {
+    if (typeof text !== "string" || !text.length) return null;
+    const tail = text.slice(-500);
+    const match = tail.match(SOURCEMAP_COMMENT_RE);
+    if (!match) return null;
+    const raw = match[1];
+    if (raw.startsWith("data:")) return null; // mapa inline en base64, no es un archivo "expuesto" aparte
+    try {
+      return new URL(raw, scriptUrl).href;
+    } catch {
+      return null;
+    }
+  }
+
   // Firmas en el DOM: content.js corre en el mundo AISLADO, que comparte el
   // DOM con la página (esto SÍ lo puede leer) pero no sus variables JS
   // globales (window.React, etc. -- eso lo cubre network-interceptor.js,
@@ -92,7 +115,13 @@
     { test: () => !!document.querySelector('[ng-version]'), name: "Angular", category: "Framework frontend", confidence: 90, evidence: "atributo ng-version" },
     { test: () => !!document.getElementById("__next"), name: "Next.js", category: "Framework frontend", confidence: 85, evidence: "id=__next" },
     { test: () => !!document.getElementById("__nuxt"), name: "Nuxt.js", category: "Framework frontend", confidence: 85, evidence: "id=__nuxt" },
-    { test: () => !!document.querySelector("[data-reactroot], [data-reactid]"), name: "React", category: "Framework frontend", confidence: 65, evidence: "atributo data-reactroot/data-reactid" },
+    // data-reactroot/data-reactid solo existían en React 15/16 -- React 17+
+    // (la inmensa mayoría de apps reales hoy) lo eliminó por completo. Se
+    // deja como señal débil de respaldo (por si acaso), pero la detección
+    // confiable de React moderno vive en network-interceptor.js (mundo
+    // MAIN), vía las propiedades internas __reactFiber$/__reactContainer$
+    // que React sigue adjuntando al DOM sin importar la versión.
+    { test: () => !!document.querySelector("[data-reactroot], [data-reactid]"), name: "React", category: "Framework frontend", confidence: 50, evidence: "atributo data-reactroot/data-reactid (React ≤16, obsoleto en versiones modernas)" },
     { test: () => !!document.querySelector('script[src*="cdn.shopify.com" i]'), name: "Shopify", category: "E-commerce", confidence: 90, evidence: "script cdn.shopify.com" },
     { test: () => !!document.querySelector('script[src*="jquery" i]'), name: "jQuery", category: "Librería JS", confidence: 55, evidence: "script src jquery" },
     { test: () => !!document.querySelector('link[href*="/skin/frontend/" i], script[src*="/skin/frontend/" i]'), name: "Magento", category: "E-commerce", confidence: 85, evidence: "ruta /skin/frontend/" },
@@ -158,6 +187,7 @@
     }
 
     const srcs = Array.from(document.querySelectorAll("script[src]")).map((s) => s.src).slice(0, 40);
+    const allSourceMaps = [];
 
     await Promise.all(
       srcs.map(async (src) => {
@@ -167,6 +197,8 @@
           const { secrets, jwts } = scanText(text, src);
           allSecrets.push(...secrets);
           allJwts.push(...jwts);
+          const mapUrl = detectSourceMapReference(text, src);
+          if (mapUrl) allSourceMaps.push({ scriptUrl: src, mapUrl });
         } catch {
           // CORS u otro fallo de red: ignorar, es best-effort
         }
@@ -182,7 +214,7 @@
       } catch {}
     }
 
-    if (allSecrets.length || allJwts.length || techSignals.length) {
+    if (allSecrets.length || allJwts.length || techSignals.length || allSourceMaps.length) {
       // Solo mandamos los tokens crudos: el decodificador vive en background.js
       // (una sola fuente de verdad para los niveles OBSERVED/SUSPICIOUS/CANDIDATE,
       // en vez de mantener dos implementaciones que podrían desincronizarse)
@@ -192,6 +224,7 @@
         secrets: allSecrets,
         jwtTokens: [...new Set(allJwts.map((j) => j.token))],
         techSignals,
+        sourceMaps: allSourceMaps,
       });
     }
   }

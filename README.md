@@ -5,7 +5,7 @@ vivo durante bug bounty**, con un puente opcional hacia tus herramientas
 CLI locales (nuclei, httpx, katana, arjun, dalfox, ffuf, dnsx, gau,
 subfinder).
 
-Creada por **Zuk4r1**. Ver [LICENSE](./LICENSE) para
+Creada por **Zuk4r1 (Yordan Suárez)**. Ver [LICENSE](./LICENSE) para
 términos de atribución y uso.
 
 > Uso exclusivo en programas autorizados: VDP, Bug Bounty, pentest
@@ -47,6 +47,12 @@ si es un agregado de las rutas anidadas debajo. Clic en cualquier nodo con
 endpoint(s) despliega la ruta completa exacta (`GET https://…`).
 
 ### 📡 Endpoints
+También marca **posible ausencia de rate limiting**: un endpoint sensible
+(login/OTP/reset-password, por patrón de ruta) visto 5+ veces sin haber
+recibido nunca un HTTP 429 aparece destacado arriba de la lista — no
+confirma la ausencia, solo que no se observó throttling en el tráfico
+capturado hasta ahora.
+
 Lista completa de cada solicitud capturada: método, URL, cuántas veces se
 vio, hora del último, código HTTP, y si iba autenticada. Al expandir un
 endpoint: metadata (content-type, tamaño de respuesta, página que lo
@@ -106,14 +112,30 @@ para claves que no son secretos por sí solas (Stripe publishable key,
 config de Firebase, DSN de Sentry) — en vez de tratarlas como hallazgo
 crítico igual que una AWS key real.
 
+También detecta **source maps referenciados** (`//# sourceMappingURL=`),
+pasivamente y sin tráfico extra. Verificar si de verdad están expuestos
+(botón "Verificar exposición", requiere modo Asistido/Activo y respeta el
+Scope Guard) descarga el `.map` real y, si trae el código fuente original
+completo (`sourcesContent`), busca endpoints internos y secretos ahí —
+código que a veces nunca aparece en el bundle minificado final.
+
 ### 🌐 CORS/CSP
-Cada hallazgo se puede expandir con doble clic a una tarjeta completa:
-Directiva, Valor observado, Origen, Tipo, Severidad, Confianza, una
-sección "¿Por qué importa?" que explica el riesgo sin sobre-afirmar
-explotabilidad, la Evidencia (header crudo capturado), y validación
-sugerida con botones **Ver respuesta**, **Ver headers**, **Copiar
-evidencia**, y **Marcar como falso positivo** (queda persistido y
-marcado visualmente, sin borrar el hallazgo).
+También cubre headers de seguridad básicos (HSTS, X-Frame-Options,
+X-Content-Type-Options, Permissions-Policy) y hallazgos de **OAuth/OIDC**
+(state ausente = CSRF en OAuth, PKCE ausente, flujo implícito deprecado,
+redirect_uri observado como hipótesis a probar) — no solo CORS/CSP,
+reusando la misma tarjeta. Cada hallazgo se puede expandir con doble clic
+a una tarjeta completa: Directiva, Valor observado, Origen, Tipo,
+Severidad, Confianza, una sección "¿Por qué importa?" que explica el
+riesgo sin sobre-afirmar explotabilidad, la Evidencia (header/parámetro
+crudo capturado), y validación sugerida con botones **Ver respuesta**,
+**Ver headers**, **Copiar evidencia**, y **Marcar como falso positivo**
+(queda persistido y marcado visualmente, sin borrar el hallazgo).
+X-Frame-Options ausente no se reporta si CSP ya trae `frame-ancestors`
+(evita falso positivo). El flujo OAuth se detecta por la forma de los
+query params (`client_id`+`redirect_uri`+`response_type` juntos), no por
+una ruta fija, ya que dispara con cualquier request (incluida la
+navegación completa típica del paso de autorización).
 
 ### ⬡ GraphQL
 Detecta operaciones GraphQL **por la forma del body**, no por la URL (no
@@ -156,13 +178,26 @@ firmas en el DOM (meta generator, rutas como `wp-content`, atributos como
 corrobora la misma tecnología, la confianza sube en vez de duplicar la
 entrada.
 
+### 🔗 Cadenas
+Cruza automáticamente datos que ya viste en otras pestañas — nunca
+ejecuta nada nuevo, solo lee lo ya capturado — para sugerir combinaciones
+que valen la pena probar juntas, no aisladas (SSRF candidato + secreto
+AWS visto → probar metadata de instancia; CORS crítico + endpoint
+autenticado; IDOR de alta confianza + entidad correlacionada con más
+recursos; mutation GraphQL + JWT débil; source map con secretos dentro;
+OAuth sin PKCE + Open Redirect candidato). Cada regla exige **dos**
+señales concretas en la misma sesión, nunca una sola pista aislada — son
+hipótesis para que las valides vos, no hallazgos confirmados.
+
 ### 🛡️ Scope
 Definís un programa activo con patrones `allow`/`deny` (admite
 `*.dominio.com`). A partir de ahí, todo lo capturado se marca dentro/fuera
-de scope en el resto del panel, y **cualquier acción activa queda
-bloqueada contra objetivos fuera de scope** — sin importar el modo
-seleccionado. La validación se repite también del lado del agente nativo,
-no solo en la interfaz, como defensa en profundidad.
+de scope en el resto del panel. **Fail-closed real**: cualquier acción
+activa (CORS en vivo, ejecución de herramientas CLI) requiere que el
+objetivo matchee explícitamente un patrón `allow` — sin scope configurado,
+con `allow` vacío, o con el host en `deny`, la acción queda bloqueada por
+defecto, no permitida. La validación se repite también del lado del
+agente nativo de forma independiente, como defensa en profundidad real.
 
 ### 📝 Notas / Reporte
 Acá armás el reporte final de la sesión:
@@ -170,13 +205,16 @@ Acá armás el reporte final de la sesión:
   Low/Informational) y un cuerpo libre para steps to reproduce e impacto
 - **Se completa solo** desde la pestaña IDOR con el botón "Crear hallazgo"
   (trae el título, severidad y detalle ya armados, incluyendo las señales
-  que motivaron el candidato)
+  que motivaron el candidato, y el checklist de qué falta demostrar)
+- Cada hallazgo muestra la **traducción de severidad a HackerOne/Bugcrowd/
+  Intigriti** (Bugcrowd usa su propia taxonomía P1-P5, no las mismas
+  etiquetas que las otras dos) — tanto en la lista como en el export
 - Lista de todos los hallazgos guardados en la sesión, con severidad y
   fecha, para revisar antes de exportar
 - **"Exportar reporte"** (botón en el header, arriba de todo) descarga un
   archivo Markdown con todos los hallazgos guardados, formateado para
-  adaptar directo a HackerOne/Bugcrowd/Intigriti — con la evidencia y el
-  confidence % de cada uno, no solo el título
+  adaptar directo a HackerOne/Bugcrowd/Intigriti — con la evidencia, el
+  confidence % de cada uno, y la traducción de severidad, no solo el título
 
 ## 🔐 Controles generales (header del panel)
 
@@ -210,7 +248,6 @@ timeout, sin salida truncada) — con opción de copiarlo o de igual forma
 ejecutarlo desde la extensión. Los jobs corren en cola (varios en
 paralelo), con streaming de salida en vivo y la posibilidad de expandir
 cada uno para ver su resultado completo.
-
 
 ## ⚙️ Instalación
 
@@ -265,7 +302,6 @@ manuales adicionales. Recargá la extensión después de instalar el agente.
    confianza calculada, **Entidades** para correlaciones entre recursos
 5. Guardá lo que confirmes en **Notas / Reporte** (a mano, o con "Crear
    hallazgo" desde IDOR) y exportalo en Markdown al terminar la sesión
-
 
 ## ⚖️ Licencia y autoría
 

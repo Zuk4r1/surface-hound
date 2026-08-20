@@ -282,13 +282,47 @@
   // variables JS globales -- window.React ahí es undefined aunque React
   // esté cargado de verdad, porque el mundo aislado tiene su propio objeto
   // window separado. Esto SOLO se puede ver desde acá.
+  // Detección por propiedades internas del DOM en vez de globales de window:
+  // window.React/window.Vue casi nunca están expuestos en builds de
+  // producción reales (quedan encapsulados dentro del bundle) -- pero React
+  // (16+) y Vue (3+) SIGUEN adjuntando propiedades internas directo a los
+  // nodos del DOM para su propio funcionamiento interno (reconciliación,
+  // manejo de eventos). Esto no se puede eliminar con tree-shaking porque
+  // es comportamiento en tiempo de ejecución, no una conveniencia de debug
+  // -- sobrevive a cualquier build de producción, a diferencia de
+  // "data-reactroot" (React 15/16 lo tenía; React 17+ lo eliminó por
+  // completo) o de confiar solo en window.React.
+  function detectByDomExpandoProps(prefixes, sampleSize = 12) {
+    try {
+      const candidates = [document.body, ...Array.from(document.body?.children || []).slice(0, sampleSize)];
+      for (const el of candidates) {
+        if (!el) continue;
+        for (const key of Object.keys(el)) {
+          if (prefixes.some((p) => key.startsWith(p))) return true;
+        }
+      }
+    } catch {}
+    return false;
+  }
+
   function checkGlobalTechSignals() {
     const found = [];
     try {
-      if (window.React) found.push({ name: "React", category: "Framework frontend", confidence: 88, evidence: "window.React" });
-      if (window.Vue) found.push({ name: "Vue.js", category: "Framework frontend", confidence: 88, evidence: "window.Vue" });
+      if (window.React) {
+        found.push({ name: "React", category: "Framework frontend", confidence: 88, evidence: "window.React" });
+      } else if (detectByDomExpandoProps(["__reactFiber$", "__reactContainer$", "__reactProps$"])) {
+        found.push({ name: "React", category: "Framework frontend", confidence: 85, evidence: "propiedades internas __reactFiber$/__reactContainer$ en el DOM (window.React no expuesto -- típico de builds de producción)" });
+      }
+      if (window.Vue) {
+        found.push({ name: "Vue.js", category: "Framework frontend", confidence: 88, evidence: "window.Vue" });
+      } else if (detectByDomExpandoProps(["__vue_app__", "__vueParentComponent", "__vnode"])) {
+        found.push({ name: "Vue.js", category: "Framework frontend", confidence: 82, evidence: "propiedades internas __vue_app__/__vueParentComponent en el DOM" });
+      }
       if (window.angular) found.push({ name: "AngularJS", category: "Framework frontend", confidence: 85, evidence: "window.angular" });
       if (window.__NEXT_DATA__) found.push({ name: "Next.js", category: "Framework frontend", confidence: 92, evidence: "window.__NEXT_DATA__" });
+      // Next.js con App Router (13+) no siempre expone __NEXT_DATA__, pero
+      // sigue registrando sus chunks bajo este namespace de webpack.
+      if (!window.__NEXT_DATA__ && window.webpackChunk_N_E) found.push({ name: "Next.js", category: "Framework frontend", confidence: 80, evidence: "window.webpackChunk_N_E (namespace de chunks de Next.js)" });
       if (window.__NUXT__) found.push({ name: "Nuxt.js", category: "Framework frontend", confidence: 92, evidence: "window.__NUXT__" });
       if (window.jQuery) found.push({ name: "jQuery", category: "Librería JS", confidence: 70, evidence: "window.jQuery" });
       if (window.Shopify) found.push({ name: "Shopify", category: "E-commerce", confidence: 92, evidence: "window.Shopify" });

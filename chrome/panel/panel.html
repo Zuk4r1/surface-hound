@@ -34,6 +34,7 @@
     <button class="tab-btn" data-tab="graphql">GraphQL</button>
     <button class="tab-btn" data-tab="websocket">WebSocket</button>
     <button class="tab-btn" data-tab="tech">Tecnología</button>
+    <button class="tab-btn" data-tab="chains">Cadenas</button>
     <button class="tab-btn" data-tab="scope">Scope</button>
     <button class="tab-btn" data-tab="notes">Notas / Reporte</button>
   </nav>
@@ -44,6 +45,7 @@
       <div id="mapa-tree"></div>
     </section>
     <section id="tab-endpoints" class="tab-content">
+      <div id="ratelimit-list" style="margin-bottom:14px"></div>
       <div id="endpoints-list"></div>
 
       <details id="cli-section" style="margin-top:16px">
@@ -74,8 +76,14 @@
       <div id="entidades-list"></div>
     </section>
     <section id="tab-jwt" class="tab-content"><div id="jwt-list"></div></section>
-    <section id="tab-secrets" class="tab-content"><div id="secrets-list"></div></section>
-    <section id="tab-cors" class="tab-content"><div id="cors-list"></div></section>
+    <section id="tab-secrets" class="tab-content">
+      <div id="sourcemaps-list" style="margin-bottom:14px"></div>
+      <div id="secrets-list"></div>
+    </section>
+    <section id="tab-cors" class="tab-content">
+      <div class="hint" style="margin-bottom:8px">Hallazgos de CORS, CSP, headers de seguridad básicos (HSTS, X-Frame-Options, X-Content-Type-Options, Permissions-Policy), y flujos OAuth/OIDC (state/PKCE/redirect_uri) — reconocimiento estándar sobre el documento HTML principal, evitando ruido en respuestas de API/assets.</div>
+      <div id="cors-list"></div>
+    </section>
     <section id="tab-graphql" class="tab-content">
       <div class="hint" style="margin-bottom:8px">Operaciones GraphQL detectadas por la forma del body (no depende de que la URL contenga "graphql"). Las mutations quedan marcadas como candidatas a BFLA — autorización a nivel de operación es el patrón que casi nadie prueba a mano.</div>
       <div id="graphql-introspection-list" style="margin-bottom:14px"></div>
@@ -88,6 +96,10 @@
     <section id="tab-tech" class="tab-content">
       <div class="hint" style="margin-bottom:8px">Detección 100% pasiva: headers de respuesta (Server, X-Powered-By), cookies características (PHPSESSID, laravel_session), firmas en el DOM, y variables JS globales. La confianza sube cuando más de una fuente corrobora la misma tecnología.</div>
       <div id="tech-list"></div>
+    </section>
+    <section id="tab-chains" class="tab-content">
+      <div class="hint" style="margin-bottom:8px">Cruces automáticos entre pestañas (IDOR, Entidades, Secretos, GraphQL, OAuth, CORS) cuando dos señales concretas coinciden en la misma sesión. Nunca ejecuta nada — son hipótesis para validar vos, no hallazgos confirmados.</div>
+      <div id="chains-list"></div>
     </section>
     <section id="tab-scope" class="tab-content">
       <div class="hint" style="margin-bottom:8px">
