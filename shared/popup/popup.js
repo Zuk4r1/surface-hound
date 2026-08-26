@@ -161,7 +161,17 @@ function openFullView(domain) {
   if (!tab?.url) return;
   let domain;
   try {
-    domain = new URL(tab.url).hostname;
+    const parsed = new URL(tab.url);
+    // No alcanza con que new URL() no tire excepción -- chrome://, chrome-extension://,
+    // about:, etc. parsean bien y TIENEN un "hostname" estructural, pero no
+    // son páginas web reales sobre las que la extensión pueda haber
+    // capturado nada. Mostrarlas como si fueran un dominio analizable es
+    // engañoso (antes solo el catch de abajo mostraba el mensaje correcto).
+    if (!/^https?:$/.test(parsed.protocol)) throw new Error("no es http/https");
+    // Misma normalización que en panel-core.js y background.js: "www.x.com"
+    // y "x.com" deben leer la misma clave de storage, o los hallazgos
+    // detectados en una variante parecen "desaparecer" al pasar a la otra.
+    domain = parsed.hostname.replace(/^www\./i, "");
   } catch {
     document.getElementById("grid").innerHTML = `<div class="empty-msg">Esta pestaña no es una página web normal.</div>`;
     return;

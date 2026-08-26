@@ -16,6 +16,9 @@
     <div class="actions">
       <button id="refresh">Refrescar</button>
       <button id="export">Exportar reporte</button>
+      <button id="export-session" title="Descarga TODOS los datos crudos del dominio (no solo el reporte) como JSON, para respaldo o para continuar en otra máquina">Exportar sesión</button>
+      <button id="import-session-btn" title="Fusiona una sesión exportada con lo que ya tenés capturado en este dominio -- no borra nada">Importar sesión</button>
+      <input type="file" id="import-session-file" accept="application/json" style="display:none">
       <button id="clear">Limpiar dominio</button>
       <button id="clear-all" title="Borra TODOS los dominios capturados, no solo este">Limpiar TODOS</button>
     </div>
@@ -32,7 +35,6 @@
     <button class="tab-btn" data-tab="secrets">Secretos</button>
     <button class="tab-btn" data-tab="cors">CORS/CSP</button>
     <button class="tab-btn" data-tab="graphql">GraphQL</button>
-    <button class="tab-btn" data-tab="websocket">WebSocket</button>
     <button class="tab-btn" data-tab="tech">Tecnología</button>
     <button class="tab-btn" data-tab="chains">Cadenas</button>
     <button class="tab-btn" data-tab="scope">Scope</button>
@@ -89,10 +91,6 @@
       <div id="graphql-introspection-list" style="margin-bottom:14px"></div>
       <div id="graphql-list"></div>
     </section>
-    <section id="tab-websocket" class="tab-content">
-      <div class="hint" style="margin-bottom:8px">Conexiones WebSocket detectadas (chat en vivo, trading, notificaciones push). El volumen de mensajes se muestrea para no saturar el storage — el conteo total es real, las muestras guardadas son solo un vistazo.</div>
-      <div id="websocket-list"></div>
-    </section>
     <section id="tab-tech" class="tab-content">
       <div class="hint" style="margin-bottom:8px">Detección 100% pasiva: headers de respuesta (Server, X-Powered-By), cookies características (PHPSESSID, laravel_session), firmas en el DOM, y variables JS globales. La confianza sube cuando más de una fuente corrobora la misma tecnología.</div>
       <div id="tech-list"></div>
@@ -116,6 +114,15 @@
         <button id="scope-save">Guardar scope</button>
       </div>
       <div id="scope-status" class="hint"></div>
+      <div class="cors-card-divider" style="margin-top:14px"></div>
+      <div class="hint" style="margin-top:8px;margin-bottom:8px">Vista agregada de todos los dominios capturados que coinciden con el scope de arriba -- útil cuando el programa cubre varios subdominios, no solo el que estás mirando ahora.</div>
+      <button id="btn-program-summary">Ver resumen del programa completo</button>
+      <div id="program-summary"></div>
+      <div class="cors-card-divider" style="margin-top:14px"></div>
+      <div class="hint" style="margin-top:8px;margin-bottom:8px">Guardá un snapshot del estado actual para comparar más adelante -- útil para saber qué cambió desde la última vez que revisaste este dominio (nuevos endpoints, tecnología, secretos, etc.). Se compara contra el último snapshot guardado, no un historial completo.</div>
+      <button id="btn-save-snapshot">Guardar snapshot</button>
+      <button id="btn-diff-snapshot">Ver cambios desde el último snapshot</button>
+      <div id="snapshot-diff"></div>
     </section>
     <section id="tab-notes" class="tab-content">
       <div class="note-form">

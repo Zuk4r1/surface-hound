@@ -26,11 +26,16 @@ function scopeMatch(hostname, pattern) {
   pattern = pattern.trim().toLowerCase();
   hostname = hostname.toLowerCase();
   if (!pattern) return false;
-  if (pattern.startsWith("*.")) {
-    const bare = pattern.slice(2);
-    return hostname === bare || hostname.endsWith("." + bare);
-  }
-  return hostname === pattern;
+  // Un patrón "pelado" (sin *.) cubre el dominio Y todos sus subdominios --
+  // igual que si se hubiera escrito con el wildcard explícito. La mayoría
+  // de los programas de bug bounty listan un dominio raíz dando por hecho
+  // que cubre sus subdominios; exigir el "*." a mano era una fuente real
+  // de falsos "fuera de scope" (ej.: "clearstreet.io" en Permitido dejaba
+  // "www.clearstreet.io" marcado fuera de scope con pruebas activas
+  // bloqueadas, pese a no haber nada excluido). El "*." sigue aceptándose
+  // como sinónimo explícito, por compatibilidad con scopes ya guardados.
+  const bare = pattern.startsWith("*.") ? pattern.slice(2) : pattern;
+  return hostname === bare || hostname.endsWith("." + bare);
 }
 
 // Devuelve true (en scope), false (fuera de scope) o null (scope no configurado,
@@ -258,6 +263,21 @@ function extractEntitiesFromUrl(url) {
   return out;
 }
 
+// Sin tope, updateEntityGraph podía crecer sin límite: conecta cada PAR de
+// entidades distintas vistas en la misma respuesta (O(n²) por respuesta), y
+// nunca dejaba de agregar nodos nuevos. Medido con una simulación de sesión
+// larga realista (80 endpoints, no un caso extremo artificial): 5.5 MB solo
+// en esta estructura, proyectando a ~20 MB en una sesión de varias horas
+// contra un programa grande. Dos topes, atacando las dos fuentes del
+// crecimiento por separado:
+//  - MAX_ENTITIES_PER_RESPONSE acota el O(n²) de una sola respuesta con
+//    muchísimos campos tipo-id (común en listados grandes de una API).
+//  - MAX_ENTITY_NODES acota el crecimiento acumulado a lo largo de toda
+//    la sesión -- una vez alcanzado, no se agregan nodos NUEVOS, pero los
+//    ya existentes se siguen actualizando (count/urls) con normalidad.
+const MAX_ENTITIES_PER_RESPONSE = 40;
+const MAX_ENTITY_NODES = 3000;
+
 function ensureEntityGraph(data) {
   if (!data.entityGraph) data.entityGraph = { nodes: {}, edges: {} };
   if (!data.entitySeenInResponse) data.entitySeenInResponse = {};
@@ -265,22 +285,28 @@ function ensureEntityGraph(data) {
 
 function updateEntityGraph(data, entities, sourceUrl) {
   ensureEntityGraph(data);
-  const nodeIds = [];
-  for (const e of entities) {
+  if (data.domain) entityGraphDirty.add(data.domain); // ver saveDomainData: solo se reescribe la clave separada si esto está marcado
+  const capped = entities.slice(0, MAX_ENTITIES_PER_RESPONSE);
+  // Se trackean solo las entidades que realmente entraron al grafo (nodo ya
+  // existente, o nodo nuevo que no chocó con el tope) -- así el cálculo de
+  // pares más abajo nunca conecta un nodo que no llegó a registrarse.
+  const tracked = [];
+  for (const e of capped) {
     const nodeId = `${e.key}:${e.value}`;
-    nodeIds.push(nodeId);
-    if (!data.entityGraph.nodes[nodeId]) {
-      data.entityGraph.nodes[nodeId] = { key: e.key, value: e.value, count: 0, urls: [] };
+    let node = data.entityGraph.nodes[nodeId];
+    if (!node) {
+      if (Object.keys(data.entityGraph.nodes).length >= MAX_ENTITY_NODES) continue;
+      node = data.entityGraph.nodes[nodeId] = { key: e.key, value: e.value, count: 0, urls: [] };
     }
-    const node = data.entityGraph.nodes[nodeId];
     node.count += 1;
     if (sourceUrl && !node.urls.includes(sourceUrl) && node.urls.length < 5) node.urls.push(sourceUrl);
+    tracked.push({ nodeId, key: e.key });
   }
   // conectar cada par de entidades DISTINTAS (distinta key) vistas juntas en el mismo JSON
-  for (let i = 0; i < nodeIds.length; i++) {
-    for (let j = i + 1; j < nodeIds.length; j++) {
-      const a = nodeIds[i], b = nodeIds[j];
-      if (entities[i].key === entities[j].key) continue; // no conectar dos valores del mismo campo
+  for (let i = 0; i < tracked.length; i++) {
+    for (let j = i + 1; j < tracked.length; j++) {
+      const a = tracked[i].nodeId, b = tracked[j].nodeId;
+      if (tracked[i].key === tracked[j].key) continue; // no conectar dos valores del mismo campo
       data.entityGraph.edges[a] = data.entityGraph.edges[a] || {};
       data.entityGraph.edges[b] = data.entityGraph.edges[b] || {};
       data.entityGraph.edges[a][b] = (data.entityGraph.edges[a][b] || 0) + 1;
@@ -289,19 +315,7 @@ function updateEntityGraph(data, entities, sourceUrl) {
   }
 }
 
-function findRelatedEntities(data, key, value, limit = 5) {
-  ensureEntityGraph(data);
-  const nodeId = `${key}:${value}`;
-  const edges = data.entityGraph.edges[nodeId];
-  if (!edges) return [];
-  return Object.entries(edges)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, limit)
-    .map(([otherId, count]) => {
-      const node = data.entityGraph.nodes[otherId];
-      return { key: node?.key, value: node?.value, count, urls: node?.urls || [] };
-    });
-}
+
 
 // ---- GraphQL: detección de operación, introspection y candidatos BFLA -----
 // Cualquier POST puede ser GraphQL sin importar la URL (no todos usan
@@ -331,7 +345,7 @@ function parseGraphQLOperations(bodyText) {
   const items = Array.isArray(parsed) ? parsed : [parsed];
   const ops = [];
   for (const item of items.slice(0, 20)) {
-    if (!item || typeof item.query !== "string") continue;
+    if (!item || typeof item.query !== "string" || !item.query.trim()) continue;
     const queryText = item.query;
     const match = queryText.match(GRAPHQL_OP_RE);
     // "{ campo }" sin la palabra "query" adelante es una query implícita
@@ -423,7 +437,25 @@ const MAX_ROOT_FIELDS = 150;
 
 const SENSITIVE_FIELD_RE = /\b(password|passwd|secret|token|api[_-]?key|apikey|ssn|social[_-]?security|credit[_-]?card|creditcard|cvv|cvc|private[_-]?key|privatekey|access[_-]?token|refresh[_-]?token|auth[_-]?code|pin\b|otp\b|salary|bank[_-]?account)\b/i;
 
-const PRIVILEGED_MUTATION_RE = /^(delete|remove|destroy|ban|suspend|impersonate|grant|revoke|setrole|assignrole|makeadmin|promote|demote|disable|enable|force|purge|wipe|resetall|override)/i;
+const PRIVILEGED_VERBS = new Set(["delete", "remove", "destroy", "ban", "suspend", "impersonate", "grant", "revoke", "setrole", "assignrole", "makeadmin", "promote", "demote", "disable", "enable", "force", "purge", "wipe", "resetall", "override"]);
+
+// Antes esto era un regex ancladdo con ^ (solo detectaba el verbo si era
+// literalmente la PRIMERA palabra del nombre) -- las convenciones de
+// nombres en GraphQL varían mucho entre APIs (verbo-primero vs.
+// sustantivo-primero, o con un namespace/prefijo como "adminDeleteUser"),
+// así que mutations reales y peligrosas como "adminDeleteUser",
+// "userDelete" (convención noun-first), o "hardDeleteUser" (modificador
+// antes del verbo) nunca se marcaban como privilegiadas. Ahora se separa
+// el nombre en "palabras" (camelCase/snake_case/kebab-case) y se busca el
+// verbo como palabra completa en cualquier posición, no solo al inicio.
+function looksLikePrivilegedMutation(name) {
+  if (!name) return false;
+  const words = name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .split(/[\s_-]+/)
+    .map((w) => w.toLowerCase());
+  return words.some((w) => PRIVILEGED_VERBS.has(w));
+}
 
 function graphqlTypeToString(typeRef) {
   if (!typeRef) return "?";
@@ -462,7 +494,7 @@ function analyzeGraphQLSchema(schemaJson) {
   const queryFields = queryTypeName ? extractRootFields(queryTypeName) : [];
   const mutationFields = (mutationTypeName ? extractRootFields(mutationTypeName) : []).map((f) => ({
     ...f,
-    looksPrivileged: PRIVILEGED_MUTATION_RE.test(f.name),
+    looksPrivileged: looksLikePrivilegedMutation(f.name),
   }));
   const subscriptionFields = subscriptionTypeName ? extractRootFields(subscriptionTypeName) : [];
 
@@ -561,7 +593,14 @@ function scoreIdorCandidate(candidate, data) {
     score += 2;
 
     const segments = candidate.template.split("/");
-    const idIdx = segments.indexOf("{id}");
+    // Antes usaba indexOf (siempre el PRIMER {id} en la plantilla) -- en una
+    // URL con varios segmentos tipo-ID (ej. /orgs/{id}/projects/{id}/tasks/{id}),
+    // el bono de "nombre de recurso reconocible" siempre evaluaba la palabra
+    // antes del primero ("orgs"), sin importar cuál de los segmentos fue el
+    // que realmente demostró variación en el tráfico observado. El ÚLTIMO
+    // {id} suele ser el más específico/relevante en APIs REST anidadas
+    // (el recurso final que se está pidiendo, no sus ancestros en la ruta).
+    const idIdx = segments.lastIndexOf("{id}");
     const resourceSeg = idIdx > 0 ? segments[idIdx - 1].toLowerCase() : "";
     if (KNOWN_RESOURCE_WORDS.has(resourceSeg)) {
       signals.push(`nombre de recurso reconocible ("${resourceSeg}")`);
@@ -682,7 +721,12 @@ function decodeJwt(token) {
   findings.push({ tier: "OBSERVED", msg: payload.aud ? "aud: presente" : "aud: ausente" });
 
   if (payload.exp) {
-    const days = Math.round((payload.exp * 1000 - Date.now()) / (1000 * 60 * 60 * 24));
+    // Math.ceil, no Math.round -- con Math.round, un token de 30.4 días
+    // mostraba "~30 día(s)" (redondeado hacia abajo) justo al lado de la
+    // advertencia "Expiración larga (>30 días)", un mensaje que sonaba
+    // contradictorio pese a que ambos datos eran ciertos por separado.
+    // Con ceil, el valor mostrado nunca cruza el umbral de 30 hacia abajo.
+    const days = Math.ceil((payload.exp * 1000 - Date.now()) / (1000 * 60 * 60 * 24));
     if (days > 0) findings.push({ tier: "OBSERVED", msg: `Vida del token: ~${days} día(s)` });
   }
 
@@ -781,12 +825,25 @@ function analyzeCsp(headers, contentType) {
     }
     return findings;
   }
+  // Un nonce o hash presente en la CSP hace que los navegadores modernos
+  // (con soporte CSP Level 2+, la inmensa mayoría hoy) IGNOREN
+  // 'unsafe-inline' por completo -- es un patrón de compatibilidad
+  // progresiva intencional (navegadores viejos sin soporte de nonce/hash
+  // usan 'unsafe-inline', los modernos usan el nonce/hash y lo ignoran).
+  // Antes se marcaba como hallazgo sin ninguna distinción, generando un
+  // falso positivo real en una configuración segura e intencional.
+  const HASH_OR_NONCE_RE = /'(nonce-[A-Za-z0-9+/=_-]+|sha(256|384|512)-[A-Za-z0-9+/=]+)'/i;
   if (/unsafe-inline/i.test(csp)) {
+    const hasNonceOrHash = HASH_OR_NONCE_RE.test(csp);
     findings.push({
-      severity: "medium", type: "CSP", directive: "script-src / style-src",
-      observedValue: "'unsafe-inline'", confidence: "BAJA / MEDIA", rawHeader: `Content-Security-Policy: ${csp}`,
-      msg: "CSP permite 'unsafe-inline'.",
-      whyItMatters: "'unsafe-inline' permite que se ejecuten scripts o estilos puestos directamente en el HTML, sin que la CSP los bloquee. Esto NO demuestra por sí mismo una XSS — se requiere un punto de inyección real para explotarlo."
+      severity: hasNonceOrHash ? "low" : "medium", type: "CSP", directive: "script-src / style-src",
+      observedValue: "'unsafe-inline'", confidence: hasNonceOrHash ? "BAJA" : "BAJA / MEDIA", rawHeader: `Content-Security-Policy: ${csp}`,
+      msg: hasNonceOrHash
+        ? "CSP permite 'unsafe-inline', pero también incluye un nonce/hash."
+        : "CSP permite 'unsafe-inline'.",
+      whyItMatters: hasNonceOrHash
+        ? "En navegadores con soporte CSP Level 2+ (la inmensa mayoría hoy), la presencia de un nonce/hash hace que 'unsafe-inline' se IGNORE por completo -- solo aplicaría en navegadores muy antiguos sin ese soporte. Vale la pena confirmar que el nonce/hash se genera de forma impredecible en cada request (si es estático o predecible, ahí sí sería explotable pese a esto)."
+        : "'unsafe-inline' permite que se ejecuten scripts o estilos puestos directamente en el HTML, sin que la CSP los bloquee. Esto NO demuestra por sí mismo una XSS — se requiere un punto de inyección real para explotarlo."
     });
   }
   if (/unsafe-eval/i.test(csp)) {
@@ -977,39 +1034,212 @@ function domainKey(domain) {
   return STORAGE_PREFIX + domain;
 }
 
-async function getDomainData(domain) {
-  const key = domainKey(domain);
-  const res = await ext.storage.local.get(key);
-  return (
-    res[key] || {
-      domain,
-      endpoints: {},
-      params: {},
-      secrets: [],
-      jwts: [],
-      corsFindings: [],
-      cspFindings: [],
-      idorCandidates: [],
-      notes: [],
-      entityGraph: { nodes: {}, edges: {} },
-      entitySeenInResponse: {},
-      reflectedValues: {},
-      dismissedFindings: {},
-      graphqlOperations: {},
-      graphqlIntrospection: [],
-      websockets: {},
-      techFingerprint: {},
-      sourceMaps: {},
-      securityHeaderFindings: [],
-      oauthFlows: {},
-      oauthFindings: []
-    }
-  );
+// entityGraph vive en su propia clave, separada del resto -- es la
+// estructura más pesada con diferencia (medida en varios MB en sesiones
+// largas), y se marca "sucia" (entityGraphDirty) solo cuando updateEntityGraph
+// la modifica de verdad, para no reescribirla en CADA guardado cuando lo
+// que cambió fue otra cosa sin relación (un endpoint, un hallazgo CORS).
+function entityGraphKey(domain) {
+  return `${domainKey(domain)}::entities`;
+}
+const entityGraphDirty = new Set();
+
+// ---- Cache en memoria de los datos por dominio + guardado con debounce ---
+// Antes, CADA evento capturado hacía un ciclo completo de lectura+escritura
+// del blob entero de storage.local para ese dominio -- en una ráfaga de
+// varios requests casi simultáneos (común: varios recursos de una página
+// cargando a la vez), eso significaba re-leer Y re-escribir el mismo
+// objeto grande una y otra vez, aunque el lock ya serializaba
+// correctamente el orden. Con el cache, solo se lee de storage.local UNA
+// vez por dominio (la primera vez que se lo toca en esta sesión del
+// service worker); las escrituras se agrupan con un debounce corto (200ms),
+// así varios cambios seguidos terminan en un solo write real en vez de uno
+// por evento.
+//
+// Tradeoff conocido, documentado a propósito: si el service worker de MV3
+// se suspende por inactividad justo en la ventana de 200ms entre un cambio
+// y su flush, ese cambio puntual podría no llegar a guardarse. Se eligió
+// una ventana corta específicamente para minimizar ese riesgo (mucho menor
+// al umbral típico de suspensión por inactividad de Chrome), pero no es
+// una garantía absoluta -- es el mismo tipo de tradeoff que ya se acepta en
+// cualquier sistema con buffering de escritura.
+const domainDataCache = new Map();
+const pendingSaveTimers = new Map();
+const SAVE_DEBOUNCE_MS = 200;
+
+// domainDataCache no tenía ningún tope -- chrome.webRequest captura TODO
+// el tráfico global del navegador, no solo el dominio activo en el panel,
+// así que una sesión de navegación normal y larga (cientos de pestañas
+// distintas, no todas targets de bug bounty) acumulaba una entrada por
+// cada dominio visitado, para siempre, mientras el service worker
+// siguiera vivo. Medido con una simulación de 300 dominios: ~373 KB,
+// proyectando a ~1.2 MB en 1000 dominios -- mismo patrón que ya se
+// corrigió para entityGraph, pero en la capa de cache. LRU simple: Map
+// preserva el orden de inserción, así que "tocar" una entrada (delete +
+// set) la mueve al final: la más vieja sin tocar queda siempre al
+// principio, lista para evictar. Nunca se evicta un dominio con una
+// escritura pendiente sin flushear (perdería ese cambio en silencio).
+const MAX_CACHED_DOMAINS = 200;
+
+// Un dominio queda protegido de eviction mientras tenga una escritura
+// pendiente (pendingSaveTimers) -- pero esa protección solo se activa AL
+// FINAL de saveDomainData(), no durante todo el procesamiento previo
+// (clasificar parámetros, actualizar el grafo de entidades, etc.) que
+// pasa ENTRE getDomainData() y saveDomainData() dentro del mismo
+// callback bloqueado. Confirmado con test + tracing: bajo ráfagas de
+// muchos dominios DISTINTOS simultáneos, un dominio podía quedar
+// evictado a mitad de su propio procesamiento (todavía sin timer
+// registrado), y terminaba en un ciclo de evict/re-agregar que le
+// impedía guardarse del todo -- se perdían dominios enteros en
+// silencio. domainsInFlight cubre TODA la ventana de procesamiento
+// activo (desde que arranca el callback bloqueado hasta que termina),
+// no solo la cola del debounce.
+const domainsInFlight = new Set();
+
+function touchCacheEntry(domain, data) {
+  domainDataCache.delete(domain);
+  domainDataCache.set(domain, data);
 }
 
-async function saveDomainData(domain, data) {
-  await ext.storage.local.set({ [domainKey(domain)]: data });
+function evictLRUIfNeeded() {
+  if (domainDataCache.size <= MAX_CACHED_DOMAINS) return;
+  for (const key of domainDataCache.keys()) {
+    if (domainDataCache.size <= MAX_CACHED_DOMAINS) break;
+    if (pendingSaveTimers.has(key) || domainsInFlight.has(key)) continue;
+    domainDataCache.delete(key);
+  }
 }
+
+async function getDomainData(domain) {
+  if (domainDataCache.has(domain)) {
+    const data = domainDataCache.get(domain);
+    touchCacheEntry(domain, data);
+    return data;
+  }
+  const key = domainKey(domain);
+  const egKey = entityGraphKey(domain);
+  const res = await ext.storage.local.get([key, egKey]);
+  const data = res[key] || {
+    domain,
+    endpoints: {},
+    params: {},
+    secrets: [],
+    jwts: [],
+    corsFindings: [],
+    cspFindings: [],
+    idorCandidates: [],
+    notes: [],
+    entitySeenInResponse: {},
+    reflectedValues: {},
+    dismissedFindings: {},
+    graphqlOperations: {},
+    graphqlIntrospection: [],
+    techFingerprint: {},
+    sourceMaps: {},
+    securityHeaderFindings: [],
+    oauthFlows: {},
+    oauthFindings: []
+  };
+  data.entityGraph = res[egKey] || { nodes: {}, edges: {} };
+  domainDataCache.set(domain, data);
+  evictLRUIfNeeded();
+  return data;
+}
+
+function saveDomainData(domain, data) {
+  // .set() en un Map sobre una clave YA existente actualiza el valor pero
+  // NO cambia su posición en el orden de inserción -- para que una
+  // escritura también cuente como "uso reciente" a efectos del LRU (no
+  // solo las lecturas), se usa touchCacheEntry acá también.
+  touchCacheEntry(domain, data);
+  evictLRUIfNeeded();
+  if (pendingSaveTimers.has(domain)) return; // ya hay un flush programado -- viaja igual porque es el mismo objeto en memoria
+  // Importante: NO se retorna una promesa ligada al propio flush del
+  // setTimeout. withDomainLock espera (`await saveDomainData(...)`) antes
+  // de dejar avanzar al siguiente evento de la cola -- si esta función
+  // esperara los 200ms del debounce para resolver, terminaría atando TODA
+  // la cadena del lock a ese delay (cada evento se volvería más lento en
+  // vez de más rápido, justo lo opuesto de lo que se busca). El cache en
+  // memoria ya quedó actualizado de forma síncrona arriba, así que
+  // cualquier lectura posterior dentro de esta sesión del service worker
+  // ve los datos correctos sin depender de que el disco ya se haya
+  // actualizado.
+  const timer = setTimeout(async () => {
+    pendingSaveTimers.delete(domain);
+    const current = domainDataCache.get(domain);
+    if (current) {
+      const { entityGraph, ...rest } = current;
+      const toWrite = { [domainKey(domain)]: rest };
+      // entityGraph solo se reescribe si updateEntityGraph la tocó de
+      // verdad desde el último flush -- si lo que cambió fue un endpoint o
+      // un hallazgo CORS sin relación, no hace falta volver a serializar
+      // varios MB de nodos/aristas que no cambiaron en nada.
+      if (entityGraphDirty.has(domain)) {
+        toWrite[entityGraphKey(domain)] = entityGraph;
+        entityGraphDirty.delete(domain);
+      }
+      try {
+        await ext.storage.local.set(toWrite);
+      } catch (e) {
+        console.error("surface-hound: error guardando datos de", domain, e);
+      }
+    }
+    // Al FINAL, ya con la escritura de este dominio resuelta -- llamarlo
+    // antes (justo al quitar la protección del debounce) arriesgaba
+    // evictar este MISMO dominio antes de leerlo/escribirlo. Sin este
+    // reintento en algún punto, si muchos dominios de una ráfaga
+    // terminaban de flushear más o menos juntos, nada volvía a evaluar
+    // si ya se podía achicar el cache de vuelta al tope.
+    evictLRUIfNeeded();
+  }, SAVE_DEBOUNCE_MS);
+  pendingSaveTimers.set(domain, timer);
+}
+
+// Mantiene el cache sincronizado con cambios que NO pasaron por
+// saveDomainData -- "Limpiar dominio"/"Limpiar TODOS" desde el panel, la
+// migración de fusión de "www.", o una escritura directa a la clave de un
+// dominio que no es el activo (ver fix de contaminación cruzada de source
+// maps). Sin esto, el cache podría "resucitar" datos que el usuario
+// acababa de borrar si llegara un evento nuevo antes de refrescarse solo.
+ext.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local") return;
+  const ENTITY_SUFFIX = "::entities";
+  for (const [key, change] of Object.entries(changes)) {
+    if (!key.startsWith(STORAGE_PREFIX) || key.startsWith(CONFIG_PREFIX)) continue;
+    if (key.endsWith(ENTITY_SUFFIX)) {
+      // La clave separada de entityGraph -- no es un dominio en sí misma,
+      // es la sub-estructura de uno. Si ese dominio está en cache, se
+      // actualiza solo esa parte sin tocar el resto.
+      const domain = key.slice(STORAGE_PREFIX.length, -ENTITY_SUFFIX.length);
+      const cached = domainDataCache.get(domain);
+      if (cached) cached.entityGraph = change.newValue || { nodes: {}, edges: {} };
+      continue;
+    }
+    const domain = key.slice(STORAGE_PREFIX.length);
+    if (change.newValue === undefined) {
+      domainDataCache.delete(domain);
+    } else {
+      // Esta clave nunca trae entityGraph adentro (vive aparte) -- se
+      // preserva el que ya estuviera en cache para no perderlo al
+      // reemplazar el resto de los datos.
+      const existingGraph = domainDataCache.get(domain)?.entityGraph;
+      const newData = { ...change.newValue, entityGraph: existingGraph || { nodes: {}, edges: {} } };
+      touchCacheEntry(domain, newData);
+    }
+  }
+  // El dato de este batch YA está persistido en disco antes de que este
+  // listener se dispare (onChanged llega DESPUÉS de la escritura real,
+  // no antes) -- así que podar acá, incluso el dominio recién tocado, es
+  // seguro sin ninguna de las precauciones que hicieron falta para el
+  // flush del debounce (ahí sí podar antes de tiempo podía perder una
+  // escritura todavía sin persistir). Sin este llamado, cualquier
+  // escritura que no pase por saveDomainData -- Importar sesión, un
+  // "Limpiar dominio" disparado desde OTRA pestaña del panel, o
+  // cualquier sincronización entre pestañas -- bypaseaba el tope de LRU
+  // por completo. Confirmado con test: 300 escrituras por esta vía
+  // dejaban el cache en 300 entradas, no en el tope de 200.
+  evictLRUIfNeeded();
+});
 
 // ---- Lock por dominio para evitar condiciones de carrera --------------
 // webRequest puede disparar varios eventos casi simultáneos para el mismo
@@ -1021,7 +1251,23 @@ const domainLocks = new Map();
 
 function withDomainLock(domain, fn) {
   const prev = domainLocks.get(domain) || Promise.resolve();
-  const next = prev.then(fn, fn).catch((err) => console.error("surface-hound lock error:", err));
+  const wrappedFn = async () => {
+    domainsInFlight.add(domain);
+    try {
+      return await fn();
+    } finally {
+      domainsInFlight.delete(domain);
+      // En una ráfaga con muchos dominios simultáneos, TODOS pueden estar
+      // "en vuelo" a la vez cuando se intenta podar por primera vez --
+      // evictLRUIfNeeded() solo se dispara como efecto colateral de
+      // AGREGAR una entrada nueva, nunca cuando un dominio deja de estar
+      // protegido. Sin este reintento acá, una vez que la ráfaga termina
+      // el cache podía quedarse por encima del tope para siempre (nada
+      // vuelve a intentar podar si no llegan más dominios nuevos).
+      evictLRUIfNeeded();
+    }
+  };
+  const next = prev.then(wrappedFn, wrappedFn).catch((err) => console.error("surface-hound lock error:", err));
   domainLocks.set(domain, next);
   return next;
 }
@@ -1030,9 +1276,37 @@ function withDomainLock(domain, fn) {
 
 const urlHistoryByDomain = new Map();
 
-function extractDomain(url) {
+// A diferencia de extractDomain() (que normaliza "www." para decidir en
+// qué BUCKET de storage guardar los datos -- www.x.com y x.com comparten
+// bucket), esto devuelve el hostname REAL de la URL, sin normalizar.
+// Necesario para evaluar scope: un patrón como "www.dominio.com" (con
+// www, tal como lo escribió el usuario) debe evaluarse contra el
+// hostname real de cada request, no contra el bucket ya normalizado --
+// si se usara el bucket, ese patrón CON www nunca podría matchear (el
+// bucket le saca el "www." antes de llegar acá), aunque la URL real sí
+// lo tuviera. Confirmado como una inconsistencia real: el mismo request
+// podía guardar inScope:false acá mientras que un chequeo en vivo sobre
+// la misma URL (que sí usa el hostname real) decía inScope:true.
+function realHostname(url) {
   try {
     return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+}
+
+function extractDomain(url) {
+  try {
+    // "www.target.com" y "target.com" son, en la inmensa mayoría de los
+    // casos, el mismo target/app -- pero antes generaban dos claves de
+    // storage completamente separadas ("shx:target.com" vs
+    // "shx:www.target.com"), así que hallazgos detectados en una variante
+    // "desaparecían" al volver a la otra sin que nada los borrara: solo
+    // quedaban en un bucket distinto al que se estaba mirando. Se normaliza
+    // SOLO el prefijo "www." (no otros subdominios como api./admin., que sí
+    // suelen ser apps distintas y deben seguir separados).
+    const hostname = new URL(url).hostname;
+    return hostname.replace(/^www\./i, "");
   } catch {
     return null;
   }
@@ -1070,7 +1344,13 @@ function getAllHeaderValues(headerArray, name) {
   // Set-Cookie eso pierde información real, porque una respuesta típica
   // manda VARIOS Set-Cookie a la vez (sesión + CSRF + preferencias, etc.)
   // y cada uno es una pista de tecnología distinta.
-  return (headerArray || []).filter((h) => h.name.toLowerCase() === name).map((h) => h.value);
+  // El filtro "typeof h.value === 'string'" existe porque la propia
+  // documentación de chrome.webRequest contempla que un header llegue con
+  // binaryValue en vez de value cuando su contenido no es UTF-8 válido
+  // (un servidor exótico/mal configurado puede producir esto de verdad) --
+  // sin este guard, un solo header así tira todo el análisis de headers
+  // de esa respuesta, aunque el resto ya se hubiera calculado.
+  return (headerArray || []).filter((h) => h.name.toLowerCase() === name && typeof h.value === "string").map((h) => h.value);
 }
 
 const TECH_HEADER_RULES = [
@@ -1208,7 +1488,7 @@ async function upsertEndpoint(domain, url, method) {
     const data = await getDomainData(domain);
     const key = `${method} ${url.split("?")[0]}`;
     const now = Date.now();
-    const inScope = isInScope(domain, scope);
+    const inScope = isInScope(realHostname(url) || domain, scope);
     if (!data.endpoints[key]) {
       data.endpoints[key] = { url, method, firstSeen: now, lastSeen: now, hits: 1, inScope };
     } else {
@@ -1291,7 +1571,27 @@ ext.webRequest.onSendHeaders.addListener(
 
       if (hasAuth) {
         const epKey = `${details.method} ${details.url.split("?")[0]}`;
-        if (data.endpoints[epKey]) data.endpoints[epKey].hasAuth = true;
+        if (!data.endpoints[epKey]) {
+          // Condición de carrera real con onBeforeRequest: aunque Chrome
+          // dispara onBeforeRequest primero, upsertEndpoint hace un await
+          // extra (getScopeConfig) antes de llegar al lock, mientras que
+          // ESTE listener llega de forma inmediata y síncrona -- en
+          // tráfico real, puede "adelantarse" y encontrar el endpoint
+          // todavía inexistente, perdiendo hasAuth en silencio (confirmado
+          // con test: sin margen entre eventos, falla; con 50ms de
+          // margen, funciona -- es una carrera real, no un bug
+          // determinista). Se crea acá un stub con la MISMA forma que
+          // upsertEndpoint usaría (hits: 0, no 1 -- así, si upsertEndpoint
+          // corre después y toma la rama de "ya existe" incrementando
+          // hits, el conteo final queda en 1, no duplicado).
+          const scope = await getScopeConfig();
+          data.endpoints[epKey] = {
+            url: details.url, method: details.method,
+            firstSeen: Date.now(), lastSeen: Date.now(), hits: 0,
+            inScope: isInScope(realHostname(details.url) || domain, scope),
+          };
+        }
+        data.endpoints[epKey].hasAuth = true;
       }
       if (jwts.length) {
         const existing = new Set(data.jwts.map((j) => j.token));
@@ -1311,10 +1611,24 @@ ext.webRequest.onHeadersReceived.addListener(
     withDomainLock(domain, async () => {
       const headers = headersToObject(details.responseHeaders);
       const contentType = headers["content-type"] || "";
-      const corsFindings = analyzeCors(headers, contentType);
-      const cspFindings = analyzeCsp(headers, contentType);
-      const securityHeaderFindings = analyzeSecurityHeaders(headers, contentType, details.url);
-      const techFindings = analyzeTechFromHeaders(details.responseHeaders);
+      // Cada análisis corre en su propio try/catch -- si UNO tira una
+      // excepción inesperada (headers malformados, un caso límite no
+      // contemplado), los demás igual se calculan y se guardan. Antes,
+      // una sola excepción en cualquiera de estos cortaba TODO el resto
+      // del callback a mitad de camino, perdiendo hallazgos que ya se
+      // habían calculado correctamente y nunca llegaban a guardarse.
+      function safeAnalyze(label, fn) {
+        try {
+          return fn();
+        } catch (e) {
+          console.error(`surface-hound: error en ${label}:`, e);
+          return [];
+        }
+      }
+      const corsFindings = safeAnalyze("analyzeCors", () => analyzeCors(headers, contentType));
+      const cspFindings = safeAnalyze("analyzeCsp", () => analyzeCsp(headers, contentType));
+      const securityHeaderFindings = safeAnalyze("analyzeSecurityHeaders", () => analyzeSecurityHeaders(headers, contentType, details.url));
+      const techFindings = safeAnalyze("analyzeTechFromHeaders", () => analyzeTechFromHeaders(details.responseHeaders));
       // details.statusCode está disponible acá para CUALQUIER request (no
       // solo fetch/XHR, a diferencia de handleNetEvent) -- por eso el
       // rastreo de "alguna vez vimos un 429 en este endpoint" vive acá, no
@@ -1372,8 +1686,7 @@ ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "shx:netevent") {
-    if (msg.source === "websocket") handleWebSocketEvent(msg);
-    else if (msg.source === "techfingerprint") handleTechFingerprintEvent(msg);
+    if (msg.source === "techfingerprint") handleTechFingerprintEvent(msg);
     else handleNetEvent(msg);
     return false;
   }
@@ -1385,67 +1698,6 @@ async function handleTechFingerprintEvent(msg) {
   await withDomainLock(domain, async () => {
     const data = await getDomainData(domain);
     recordTechFindings(data, msg.techSignals);
-    await saveDomainData(domain, data);
-  });
-}
-
-// ---- WebSocket: conexiones, mensajes de muestra, y volumen real -----------
-// El interceptor ya throttlea qué se REPORTA (no qué se envía/recibe de
-// verdad), así que acá solo hace falta agregar sin perder la cuenta real:
-// messagesIn/messagesOut suman también los "skippedSinceLastSample" que
-// vienen en cada evento, y las muestras guardadas tienen un tope fijo (no
-// crecen sin límite en una conexión de horas).
-
-const WS_MAX_SAMPLES = 20;
-
-function ensureWebSocketData(data) {
-  if (!data.websockets) data.websockets = {};
-}
-
-async function handleWebSocketEvent(msg) {
-  const domain = extractDomain(msg.url || "");
-  if (!domain) return;
-  const scope = await getScopeConfig();
-
-  await withDomainLock(domain, async () => {
-    const data = await getDomainData(domain);
-    ensureWebSocketData(data);
-
-    const wsKey = (msg.url || "").split("?")[0];
-    if (!data.websockets[wsKey]) {
-      data.websockets[wsKey] = {
-        url: msg.url,
-        firstSeen: Date.now(),
-        lastSeen: Date.now(),
-        connections: 0,
-        messagesIn: 0,
-        messagesOut: 0,
-        sampleMessagesIn: [],
-        sampleMessagesOut: [],
-        lastCloseCode: null,
-        lastCloseReason: null,
-        inScope: isInScope(domain, scope),
-      };
-    }
-    const rec = data.websockets[wsKey];
-    rec.lastSeen = Date.now();
-
-    if (msg.event === "connect") {
-      rec.connections++;
-    } else if (msg.event === "close") {
-      rec.lastCloseCode = msg.code ?? null;
-      rec.lastCloseReason = msg.reason || null;
-    } else if (msg.event === "message_in" || msg.event === "message_out") {
-      const isIn = msg.event === "message_in";
-      const countKey = isIn ? "messagesIn" : "messagesOut";
-      const sampleKey = isIn ? "sampleMessagesIn" : "sampleMessagesOut";
-      rec[countKey] += 1 + (msg.skippedSinceLastSample || 0);
-      if (msg.data) {
-        rec[sampleKey].push({ data: msg.data.slice(0, 500), at: Date.now(), binary: !!msg.binary });
-        if (rec[sampleKey].length > WS_MAX_SAMPLES) rec[sampleKey].shift();
-      }
-    }
-
     await saveDomainData(domain, data);
   });
 }
@@ -1463,7 +1715,7 @@ async function handleNetEvent(msg) {
     const method = (msg.method || "GET").toUpperCase();
     const epKey = `${method} ${path}`;
     if (!data.endpoints[epKey]) {
-      data.endpoints[epKey] = { url: msg.url, method, firstSeen: Date.now(), lastSeen: Date.now(), hits: 0, inScope: isInScope(domain, scope) };
+      data.endpoints[epKey] = { url: msg.url, method, firstSeen: Date.now(), lastSeen: Date.now(), hits: 0, inScope: isInScope(realHostname(msg.url) || domain, scope) };
     }
     const ep = data.endpoints[epKey];
     ep.lastSeen = Date.now();

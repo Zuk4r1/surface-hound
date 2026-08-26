@@ -11,20 +11,21 @@ function domainFromUrl() {
 }
 
 async function listCapturedDomains() {
+  // La lógica real vive en panel-core.js (listCapturedDomainsFrom), cargado
+  // antes que este script -- antes había una segunda copia de esta misma
+  // lógica acá, y cuando se agregó la exclusión de la clave "::snapshot"
+  // solo se sumó en una de las dos copias, dejando la otra con el mismo
+  // bug que ya se había corregido para "::entities". Con una sola fuente
+  // de verdad, esto no puede volver a desincronizarse.
   const all = await extFull.storage.local.get(null);
-  // STORAGE_PREFIX viene de panel-core.js, cargado antes que este script.
-  // Se usa la constante en vez de repetir "shx:" a mano para que si ese
-  // prefijo cambia algún día, esto no quede desincronizado en silencio.
-  return Object.keys(all)
-    .filter((k) => k.startsWith(STORAGE_PREFIX))
-    .map((k) => k.slice(STORAGE_PREFIX.length));
+  return listCapturedDomainsFrom(all);
 }
 
 async function buildDomainSwitcher() {
   const domains = await listCapturedDomains();
   if (domains.length <= 1) return;
 
-  const current = domainFromUrl();
+  const current = (domainFromUrl() || "").replace(/^www\./i, "");
   const select = document.createElement("select");
   select.style.cssText = "margin-left:10px;background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:12px";
   for (const d of domains) {

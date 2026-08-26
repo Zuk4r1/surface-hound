@@ -18,17 +18,184 @@ window.addEventListener("unhandledrejection", (e) => {
 });
 
 let currentDomain = null;
+let lastLoadedDomain = null;
 let currentData = null;
 let nativePort = null;
 let getDomainFn = null;
 let currentMode = "passive"; // passive | assisted | active
 let currentScope = null; // { programName, allow: [], deny: [] } | null (no configurado)
-const expanded = { endpoints: new Set(), params: new Set(), jwt: new Set(), secrets: new Set(), idor: new Set(), treeIds: new Set(), treeNodes: new Set(), responseSample: new Set(), cors: new Set(), corsExtra: new Map(), graphql: new Set(), websocket: new Set(), sourcemaps: new Set() };
+const expanded = { endpoints: new Set(), params: new Set(), jwt: new Set(), secrets: new Set(), idor: new Set(), treeIds: new Set(), treeNodes: new Set(), responseSample: new Set(), cors: new Set(), corsExtra: new Map(), graphql: new Set(), sourcemaps: new Set(), tech: new Set() };
+
+// Resultado de "Probar CORS ahora", en memoria (nunca se persiste a
+// storage -- es una prueba puntual, no un hallazgo capturado). Sin esto,
+// el refresco automático del panel (cada 3s, ver setInterval más abajo)
+// reconstruye la fila desde currentData y el resultado desaparecía a los
+// pocos segundos, aunque el usuario no hubiera hecho nada -- el elemento
+// donde se mostraba siempre arrancaba vacío en cada render.
+const corsLiveResults = new Map(); // url -> { html: boolean, text: string }
+
+// El resultado normal/error se guarda como texto plano (nunca se confía
+// en que ${acao} -- el header devuelto por el SERVIDOR OBJETIVO, no
+// controlado por nosotros -- venga limpio); el caso "bloqueado" ya viene
+// como HTML seguro (escapeHtml aplicado adentro al armarlo). Sin esta
+// distinción, reinyectar un resultado guardado directo en la plantilla
+// del render podría abrir una inyección HTML si el servidor devolviera
+// algo malicioso en ese header.
+function renderCorsLiveResult(url) {
+  const r = corsLiveResults.get(url);
+  if (!r) return "";
+  return r.html ? r.text : escapeHtml(r.text);
+}
+
+
+// ---- Paginación ("mostrar más") para listas que pueden crecer a cientos de
+// entradas en una sesión larga -- en vez de volcar todo a innerHTML de una
+// (un nodo DOM por fila, sin importar cuántas haya), se renderiza solo un
+// lote por vez y un botón trae más. No es virtualización real (eso
+// necesitaría reciclar nodos al hacer scroll, más riesgo de romper algo
+// para el beneficio marginal en los volúmenes reales que se vieron hasta
+// ahora), pero evita el costo real: pintar cientos de filas con todo su
+// detalle cuando el usuario ni las está mirando.
+const PAGE_SIZE = 100;
+const visibleCounts = {};
+function getVisibleCount(listKey) {
+  return visibleCounts[listKey] || PAGE_SIZE;
+}
+function loadMoreButtonHtml(listKey, shown, total) {
+  if (shown >= total) return "";
+  return `<button class="btn-load-more" data-list-key="${listKey}" style="margin-top:10px;width:100%;padding:8px">Mostrar más (${shown} de ${total})</button>`;
+}
+function wireLoadMoreButton(el, listKey, rerenderFn) {
+  el.querySelector(`.btn-load-more[data-list-key="${listKey}"]`)?.addEventListener("click", () => {
+    visibleCounts[listKey] = getVisibleCount(listKey) + PAGE_SIZE;
+    rerenderFn();
+  });
+}
 
 const STORAGE_PREFIX = "shx:";
 const CONFIG_PREFIX = "shxcfg:";
 function domainKey(domain) {
   return STORAGE_PREFIX + domain;
+}
+
+// entityGraph vive en su PROPIA clave de storage, separada del resto de los
+// datos del dominio -- es la estructura más pesada con diferencia (llegó a
+// medirse en varios MB en una sesión larga), y separarla evita que un
+// cambio cualquiera sin relación (un hallazgo CORS nuevo, un endpoint más)
+// tenga que reescribir ese blob grande de nuevo cada vez. El panel nunca
+// ESCRIBE contenido nuevo acá (solo lo lee para mostrar la pestaña
+// Entidades) -- background.js es el único dueño real de esta clave.
+function entityGraphKey(domain) {
+  return `${domainKey(domain)}::entities`;
+}
+
+// Lista centralizada de sufijos usados por claves de storage que son
+// SUB-estructuras de un dominio (entityGraph, snapshot), no dominios en sí
+// mismos. Antes esta exclusión estaba duplicada por separado en dos
+// lugares (acá y en fullview.js) -- cuando se agregó snapshotKey, la
+// exclusión correspondiente solo se sumó en uno de los dos, dejando al
+// otro con el mismo bug que ya se había corregido para entityGraph
+// (una clave interna apareciendo como si fuera un "dominio" real). Con
+// una sola lista compartida y `listCapturedDomainsFrom()`, agregar un
+// sufijo nuevo en el futuro alcanza con tocar este archivo.
+const DOMAIN_SUBKEY_SUFFIXES = ["::entities", "::snapshot"];
+
+function listCapturedDomainsFrom(all) {
+  const domains = Object.keys(all)
+    .filter((k) => k.startsWith(STORAGE_PREFIX) && !k.startsWith(CONFIG_PREFIX) && !DOMAIN_SUBKEY_SUFFIXES.some((suf) => k.endsWith(suf)))
+    .map((k) => k.slice(STORAGE_PREFIX.length).replace(/^www\./i, ""));
+  return [...new Set(domains)];
+}
+
+// Migración de una sola vez: hasta esta versión, "www.x.com" y "x.com"
+// generaban claves de storage separadas -- si existe un bucket viejo bajo
+// "www." + el dominio actual, se fusiona acá para no dejar hallazgos
+// huérfanos ahí. No busca ser un merge perfecto entre datos en conflicto
+// (si la MISMA tecnología aparece en ambos, se mantiene la del bucket
+// actual); el objetivo es recuperar lo que falta, no reconciliar duplicados
+// con precisión milimétrica -- esto corre una vez y el bucket viejo se
+// borra después.
+// Antes, mergeLegacyDomainData() solo se llamaba con datos que venían del
+// PROPIO storage del navegador (la migración de fusión "www.") -- entrada
+// confiable, aunque el patrón de asignación por corchetes fuera el mismo
+// que ya se sabía riesgoso (ver isSafeObjectKey en background.js). Ahora
+// "Importar sesión" alimenta esta MISMA función con el contenido de un
+// archivo elegido por el usuario -- una fuente que puede ser hostil de
+// verdad (un archivo de sesión manipulado a propósito). El check
+// `!(k in target[field])` ya existente "protegía" __proto__/constructor
+// por accidente (el operador `in` recorre la cadena de prototipos, así
+// que esas claves siempre aparecen como "ya presentes" en cualquier
+// objeto común) -- no por diseño. Esa protección desaparecería en
+// silencio si alguien cambiara `in` por `hasOwnProperty` en el futuro (un
+// refactor razonable que muchos linters sugerirían). Se hace explícita.
+const DANGEROUS_MERGE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+function isSafeMergeKey(key) {
+  return typeof key === "string" && !DANGEROUS_MERGE_KEYS.has(key);
+}
+
+// typeof [] === "object" en JS -- un array pasa cualquier chequeo que solo
+// verifique "typeof x === 'object'", disfrazado de objeto-mapa real. Sin
+// este guard, importar un archivo donde (por accidente o a propósito)
+// "endpoints"/"techFingerprint"/etc. sea un array en vez de `{}` mezclaba
+// los ÍNDICES numéricos del array como si fueran claves de endpoint
+// reales, dejando la UI con basura visible ("undefined undefined",
+// "Invalid Date") sin ningún aviso de que el archivo estaba mal formado.
+function isPlainObject(x) {
+  return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
+function mergeLegacyDomainData(target, legacy) {
+  const objectMapFields = ["endpoints", "params", "techFingerprint", "graphqlOperations", "sourceMaps", "oauthFlows", "dismissedFindings", "entitySeenInResponse", "reflectedValues"];
+  for (const field of objectMapFields) {
+    if (!isPlainObject(legacy[field])) continue; // ver isPlainObject -- un array (u otro no-objeto) en este campo se descarta en vez de mezclarse por índice
+    target[field] = target[field] || {};
+    for (const [k, v] of Object.entries(legacy[field])) {
+      if (!isSafeMergeKey(k)) continue;
+      if (!(k in target[field])) target[field][k] = v;
+    }
+  }
+
+  if (isPlainObject(legacy.entityGraph)) {
+    target.entityGraph = target.entityGraph || { nodes: {}, edges: {} };
+    for (const [k, v] of Object.entries(isPlainObject(legacy.entityGraph.nodes) ? legacy.entityGraph.nodes : {})) {
+      if (!isSafeMergeKey(k)) continue;
+      if (!(k in target.entityGraph.nodes)) target.entityGraph.nodes[k] = v;
+    }
+    for (const [k, v] of Object.entries(isPlainObject(legacy.entityGraph.edges) ? legacy.entityGraph.edges : {})) {
+      if (!isSafeMergeKey(k)) continue;
+      target.entityGraph.edges[k] = { ...(v || {}), ...(target.entityGraph.edges[k] || {}) };
+    }
+  }
+
+  const dedupArrayFields = {
+    secrets: (x) => x.match,
+    jwts: (x) => x.token,
+    corsFindings: (x) => x.msg,
+    cspFindings: (x) => x.msg,
+    securityHeaderFindings: (x) => x.msg,
+    oauthFindings: (x) => x.msg,
+    idorCandidates: (x) => x.template,
+    notes: (x) => x.title + x.createdAt,
+    graphqlIntrospection: (x) => x.url,
+    // suppressionRules faltaba acá -- se perdía sin aviso al importar una
+    // sesión que trajera reglas de supresión ya aprendidas. Se dedupea por
+    // type+directive (no por createdAt, que sería casi siempre distinto
+    // entre origen y destino) -- si la MISMA regla ya existe, no hace
+    // falta una segunda copia.
+    suppressionRules: (x) => `${x.type}::${x.directive}`,
+  };
+  for (const [field, keyFn] of Object.entries(dedupArrayFields)) {
+    if (!legacy[field]?.length) continue;
+    target[field] = target[field] || [];
+    const seen = new Set(target[field].map(keyFn));
+    for (const item of legacy[field]) {
+      const k = keyFn(item);
+      if (!seen.has(k)) {
+        target[field].push(item);
+        seen.add(k);
+      }
+    }
+  }
 }
 
 // ---- Scope Guard (mismas reglas que background.js) ------------------------
@@ -38,11 +205,12 @@ function scopeMatch(hostname, pattern) {
   pattern = pattern.trim().toLowerCase();
   hostname = hostname.toLowerCase();
   if (!pattern) return false;
-  if (pattern.startsWith("*.")) {
-    const bare = pattern.slice(2);
-    return hostname === bare || hostname.endsWith("." + bare);
-  }
-  return hostname === pattern;
+  // Misma lógica que la copia en background.js (que es la que hace el
+  // enforcement real) -- ver el comentario ahí para el detalle completo.
+  // Duplicada acá porque el panel corre en otro contexto y no puede
+  // importar funciones de background.js directamente.
+  const bare = pattern.startsWith("*.") ? pattern.slice(2) : pattern;
+  return hostname === bare || hostname.endsWith("." + bare);
 }
 
 function isInScope(hostname, scope) {
@@ -186,16 +354,175 @@ async function loadScopeForm() {
 
 document.getElementById("scope-save")?.addEventListener("click", async () => {
   const programName = document.getElementById("scope-program").value.trim();
-  const allow = document.getElementById("scope-allow").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  const deny = document.getElementById("scope-deny").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  // Deduplicado (case-insensitive, ya que scopeMatch tampoco distingue
+  // mayúsculas/minúsculas): antes, pegar el mismo dominio dos veces por
+  // accidente hacía que el mensaje de estado dijera "3 patrón(es)
+  // permitido(s)" cuando en realidad solo había 1 patrón único distinto
+  // -- no afectaba el funcionamiento real (un patrón repetido no rompe
+  // nada), pero el conteo mostrado era engañoso.
+  const dedupPatterns = (lines) => {
+    const seen = new Set();
+    const out = [];
+    for (const p of lines) {
+      const key = p.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(p);
+    }
+    return out;
+  };
+  const allow = dedupPatterns(document.getElementById("scope-allow").value.split("\n").map((s) => s.trim()).filter(Boolean));
+  const deny = dedupPatterns(document.getElementById("scope-deny").value.split("\n").map((s) => s.trim()).filter(Boolean));
   const scope = { programName, allow, deny };
   await ext.storage.local.set({ [CONFIG_PREFIX + "scope"]: scope });
   currentScope = scope;
-  document.getElementById("scope-status").textContent = `Guardado. Scope activo: ${programName || "(sin nombre)"} — ${allow.length} patrón(es) permitido(s), ${deny.length} exclusión(es).`;
+
+  // inScope se guarda en cada endpoint en el momento en que se
+  // captura -- si el usuario corrige el scope DESPUÉS de haber navegado el
+  // sitio, todo lo que el navegador ya tenga en su propia caché (assets
+  // estáticos que no vuelven a pasar por la red) se queda con el valor
+  // viejo para siempre, sin importar cuántas veces se guarde el scope de
+  // nuevo. Se recalcula acá mismo para todo lo ya capturado en el dominio
+  // actual, usando el hostname real de cada URL (no el bucket
+  // normalizado del dominio, que le saca el "www." y podía hacer que un
+  // patrón escrito CON www nunca matcheara).
+  let recalculated = 0;
+  for (const ep of Object.values(currentData.endpoints || {})) {
+    const host = hostnameOf(ep.url);
+    if (!host) continue;
+    const newInScope = isInScope(host, scope);
+    if (ep.inScope !== newInScope) recalculated++;
+    ep.inScope = newInScope;
+  }
+  await saveCurrent();
+
+  document.getElementById("scope-status").textContent = `Guardado. Scope activo: ${programName || "(sin nombre)"} — ${allow.length} patrón(es) permitido(s), ${deny.length} exclusión(es).${recalculated ? ` Se actualizó el estado de scope de ${recalculated} endpoint(s) ya capturado(s).` : ""}`;
   render();
 });
 
+// ---- Vista agregada multi-dominio: muchos programas de bug bounty cubren
+// varios subdominios, no solo el que se está mirando ahora -- esto agrega
+// hallazgos de TODOS los dominios ya capturados que coincidan con el
+// scope configurado, no solo el dominio activo. Bajo demanda (un botón,
+// no automático) porque implica leer varios dominios de storage de una,
+// algo que no vale la pena hacer en cada render normal.
+document.getElementById("btn-program-summary")?.addEventListener("click", async () => {
+  const el = document.getElementById("program-summary");
+  if (!currentScope || !(currentScope.allow || []).length) {
+    el.innerHTML = `<div class="empty" style="margin-top:8px">Configurá al menos un patrón "Permitido" arriba antes de ver el resumen del programa.</div>`;
+    return;
+  }
+  el.innerHTML = `<div class="hint" style="margin-top:8px">Cargando…</div>`;
+
+  const all = await ext.storage.local.get(null);
+  const domains = listCapturedDomainsFrom(all).filter((d) => isInScope(d, currentScope) === true);
+
+  if (!domains.length) {
+    el.innerHTML = `<div class="empty" style="margin-top:8px">Ningún dominio capturado coincide con el scope configurado todavía.</div>`;
+    return;
+  }
+
+  const summaries = domains
+    .map((d) => {
+      const data = all[domainKey(d)] || {};
+      return {
+        domain: d,
+        endpoints: Object.keys(data.endpoints || {}).length,
+        secrets: (data.secrets || []).filter((s) => !s.byDesignPublic).length,
+        idorHigh: (data.idorCandidates || []).filter((c) => c.level === "HIGH").length,
+        notes: (data.notes || []).length,
+      };
+    })
+    .sort((a, b) => b.secrets + b.idorHigh - (a.secrets + a.idorHigh));
+
+  const totals = summaries.reduce(
+    (acc, s) => ({ endpoints: acc.endpoints + s.endpoints, secrets: acc.secrets + s.secrets, idorHigh: acc.idorHigh + s.idorHigh }),
+    { endpoints: 0, secrets: 0, idorHigh: 0 }
+  );
+
+  el.innerHTML = `
+    <div class="hint" style="margin-top:10px"><b>${domains.length} dominio(s) en scope</b> · ${totals.endpoints} endpoints · ${totals.secrets} secretos (no públicos por diseño) · ${totals.idorHigh} candidatos IDOR de alta confianza</div>
+    ${summaries
+      .map(
+        (s) => `<div class="row" style="margin-top:6px">
+          <b class="mono">${escapeHtml(s.domain)}</b>
+          <div class="hint" style="margin-top:2px">${s.endpoints} endpoints · ${s.secrets} secretos · ${s.idorHigh} IDOR alta confianza · ${s.notes} notas</div>
+        </div>`
+      )
+      .join("")}
+  `;
+});
+
 loadScopeForm();
+
+// ---- Historial acotado: snapshot manual + comparación contra el último
+// guardado. A propósito NO es un historial completo con muchas versiones
+// (eso reintroduciría el mismo problema de crecimiento sin control que ya
+// se corrigió para entityGraph) -- un solo snapshot por dominio, que se
+// pisa cada vez que se guarda uno nuevo. Vive en su propia clave separada
+// (mismo patrón que entityGraphKey), así no infla el blob principal.
+function snapshotKey(domain) {
+  return `${domainKey(domain)}::snapshot`;
+}
+
+function buildSnapshotSummary(data) {
+  const corsAll = [...(data.corsFindings || []), ...(data.cspFindings || []), ...(data.securityHeaderFindings || []), ...(data.oauthFindings || [])];
+  return {
+    takenAt: Date.now(),
+    endpointKeys: Object.keys(data.endpoints || {}),
+    secretMatches: (data.secrets || []).map((s) => s.match),
+    idorTemplates: (data.idorCandidates || []).filter((c) => c.level === "HIGH").map((c) => c.template),
+    techNames: Object.keys(data.techFingerprint || {}),
+    corsFindingKeys: corsAll.map(corsFindingKey),
+    sourceMapUrls: Object.keys(data.sourceMaps || {}),
+  };
+}
+
+function diffAgainstSnapshot(current, snapshot) {
+  return {
+    newEndpoints: current.endpointKeys.filter((k) => !snapshot.endpointKeys.includes(k)),
+    newSecrets: current.secretMatches.filter((m) => !snapshot.secretMatches.includes(m)),
+    newIdor: current.idorTemplates.filter((t) => !snapshot.idorTemplates.includes(t)),
+    newTech: current.techNames.filter((t) => !snapshot.techNames.includes(t)),
+    newCorsFindings: current.corsFindingKeys.filter((k) => !snapshot.corsFindingKeys.includes(k)),
+    newSourceMaps: current.sourceMapUrls.filter((u) => !snapshot.sourceMapUrls.includes(u)),
+  };
+}
+
+document.getElementById("btn-save-snapshot")?.addEventListener("click", async () => {
+  const summary = buildSnapshotSummary(currentData);
+  await ext.storage.local.set({ [snapshotKey(currentDomain)]: summary });
+  const el = document.getElementById("snapshot-diff");
+  el.innerHTML = `<div class="hint" style="margin-top:8px">Snapshot guardado: ${new Date(summary.takenAt).toLocaleString()} (${summary.endpointKeys.length} endpoints, ${summary.secretMatches.length} secretos, ${summary.idorTemplates.length} IDOR alta confianza).</div>`;
+});
+
+document.getElementById("btn-diff-snapshot")?.addEventListener("click", async () => {
+  const el = document.getElementById("snapshot-diff");
+  const key = snapshotKey(currentDomain);
+  const res = await ext.storage.local.get(key);
+  const snapshot = res[key];
+  if (!snapshot) {
+    el.innerHTML = `<div class="empty" style="margin-top:8px">Sin snapshot guardado todavía para este dominio. Guardá uno primero.</div>`;
+    return;
+  }
+  const current = buildSnapshotSummary(currentData);
+  const diff = diffAgainstSnapshot(current, snapshot);
+  const totalNew = diff.newEndpoints.length + diff.newSecrets.length + diff.newIdor.length + diff.newTech.length + diff.newCorsFindings.length + diff.newSourceMaps.length;
+
+  const section = (title, items) =>
+    items.length ? `<div class="detail-block" style="margin-top:6px"><b>${escapeHtml(title)} (${items.length})</b>${items.slice(0, 20).map((i) => `<div class="hint mono" style="margin-top:2px">${escapeHtml(i)}</div>`).join("")}</div>` : "";
+
+  el.innerHTML = `
+    <div class="hint" style="margin-top:8px">Comparando contra el snapshot del ${new Date(snapshot.takenAt).toLocaleString()} -- ${totalNew} cosa(s) nueva(s) desde entonces.</div>
+    ${totalNew === 0 ? `<div class="empty" style="margin-top:6px">Sin cambios desde el último snapshot.</div>` : ""}
+    ${section("Endpoints nuevos", diff.newEndpoints)}
+    ${section("Secretos nuevos", diff.newSecrets)}
+    ${section("Candidatos IDOR de alta confianza nuevos", diff.newIdor)}
+    ${section("Tecnología nueva detectada", diff.newTech)}
+    ${section("Hallazgos CORS/CSP/Security Header/OAuth nuevos", diff.newCorsFindings)}
+    ${section("Source maps nuevos", diff.newSourceMaps)}
+  `;
+});
 
 async function loadData() {
   try {
@@ -205,11 +532,50 @@ async function loadData() {
       showPanelError("No se pudo detectar el dominio a inspeccionar.");
       return;
     }
-    currentDomain = domain;
+    // Se normaliza acá, en el único punto por el que pasan las tres fuentes
+    // de dominio (panel de DevTools, popup, fullview) -- así "www.x.com" y
+    // "x.com" siempre terminan operando sobre la misma clave de storage
+    // que ahora usa background.js, sin tener que sincronizar la misma
+    // normalización en cada uno de los tres archivos por separado.
+    currentDomain = domain.replace(/^www\./i, "");
+    if (currentDomain !== lastLoadedDomain) {
+      // El estado "expandido" (qué tarjetas dejaste abiertas) vive en
+      // variables de módulo que persisten mientras el panel sigue abierto
+      // -- si no se resetean al cambiar de dominio, una tarjeta con la
+      // misma clave en otro dominio (ej. "React" detectado en dos sitios
+      // distintos, algo muy común) aparece expandida sin que el usuario
+      // la haya tocado ahí. Cada Set/Map se vacía en vez de reasignar el
+      // objeto completo, para no romper ninguna referencia que otro
+      // código pueda tener guardada hacia estos mismos Sets.
+      for (const v of Object.values(expanded)) v.clear();
+      for (const k of Object.keys(visibleCounts)) delete visibleCounts[k];
+      corsLiveResults.clear();
+      lastLoadedDomain = currentDomain;
+    }
     document.getElementById("domain-title").textContent = `Superficie de ataque — ${currentDomain}`;
     const key = domainKey(currentDomain);
-    const res = await ext.storage.local.get(key);
+    const egKey = entityGraphKey(currentDomain);
+    const res = await ext.storage.local.get([key, egKey]);
     currentData = res[key] || emptyData(currentDomain);
+    currentData.entityGraph = res[egKey] || { nodes: {}, edges: {} };
+
+    // Migración de una sola vez: recuperar hallazgos que quedaron en un
+    // bucket "www." separado antes de este fix (ver mergeLegacyDomainData).
+    // Se fusiona también el entityGraph legado, que vive en su propia clave.
+    const legacyKey = domainKey("www." + currentDomain);
+    const legacyEgKey = entityGraphKey("www." + currentDomain);
+    if (legacyKey !== key) {
+      const legacyRes = await ext.storage.local.get([legacyKey, legacyEgKey]);
+      if (legacyRes[legacyKey] || legacyRes[legacyEgKey]) {
+        const legacyData = legacyRes[legacyKey] || {};
+        if (legacyRes[legacyEgKey]) legacyData.entityGraph = legacyRes[legacyEgKey];
+        mergeLegacyDomainData(currentData, legacyData);
+        await ext.storage.local.remove([legacyKey, legacyEgKey]);
+        const { entityGraph, ...restData } = currentData;
+        await ext.storage.local.set({ [key]: restData, [egKey]: entityGraph });
+      }
+    }
+
     clearPanelError();
     render();
     applyModeGating();
@@ -235,7 +601,7 @@ function clearPanelError() {
 }
 
 function emptyData(domain) {
-  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], securityHeaderFindings: [], oauthFlows: {}, oauthFindings: [], idorCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, entitySeenInResponse: {}, reflectedValues: {}, dismissedFindings: {}, graphqlOperations: {}, graphqlIntrospection: [], websockets: {}, techFingerprint: {}, sourceMaps: {} };
+  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], securityHeaderFindings: [], oauthFlows: {}, oauthFindings: [], idorCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, entitySeenInResponse: {}, reflectedValues: {}, dismissedFindings: {}, graphqlOperations: {}, graphqlIntrospection: [], techFingerprint: {}, sourceMaps: {} };
 }
 
 // ---- Severidad multi-plataforma: traducción de nuestra escala interna
@@ -333,7 +699,6 @@ function render() {
     renderSecrets();
     renderCors();
     renderGraphQL();
-    renderWebSocket();
     renderTech();
     renderChains();
     renderNotes();
@@ -560,8 +925,9 @@ function renderRateLimitFindings() {
 
 function renderEndpoints() {
   const el = document.getElementById("endpoints-list");
-  const entries = Object.values(currentData.endpoints || {}).sort((a, b) => b.lastSeen - a.lastSeen);
-  if (!entries.length) return (el.innerHTML = `<div class="empty">Sin endpoints capturados todavía. Navega el sitio.</div>`);
+  const allEntries = Object.values(currentData.endpoints || {}).sort((a, b) => b.lastSeen - a.lastSeen);
+  if (!allEntries.length) return (el.innerHTML = `<div class="empty">Sin endpoints capturados todavía. Navega el sitio.</div>`);
+  const entries = allEntries.slice(0, getVisibleCount("endpoints"));
 
   el.innerHTML = entries
     .map((e) => {
@@ -608,12 +974,12 @@ function renderEndpoints() {
               <button class="btn-cors-check" data-url="${escapeHtml(e.url)}" ${currentMode === "passive" ? "disabled title='Cambia a modo Asistido o Activo'" : ""}>Probar CORS ahora</button>
               <button class="btn-send-cli" data-url="${escapeHtml(e.url)}" ${currentMode !== "active" ? "disabled title='Requiere modo Activo'" : ""}>Analizar con CLI (avanzado)</button>
             </div>
-            <div class="cors-live-result mono hint" data-url="${escapeHtml(e.url)}"></div>
+            <div class="cors-live-result mono hint" data-url="${escapeHtml(e.url)}">${renderCorsLiveResult(e.url)}</div>
           </div>
         ` : ""}
       </div>`;
     })
-    .join("");
+    .join("") + loadMoreButtonHtml("endpoints", entries.length, allEntries.length);
 
   el.querySelectorAll(".row-head[data-kind='endpoints']").forEach((head) => {
     head.addEventListener("click", () => {
@@ -640,16 +1006,29 @@ function renderEndpoints() {
       try {
         const blocked = checkActiveActionAllowed(url);
         if (blocked) {
-          resultEl.innerHTML = `<div class="scope-warning">${escapeHtml(blocked)}</div>`;
+          corsLiveResults.set(url, { html: true, text: `<div class="scope-warning">${escapeHtml(blocked)}</div>` });
+          renderEndpoints();
           return;
         }
-        resultEl.textContent = "Probando…";
+        if (resultEl) resultEl.textContent = "Probando…"; // transitorio, indicador momentáneo -- no es la fuente de verdad, así que no importa si este nodo puntual queda desactualizado
         const result = await activeCorsCheck(url);
-        resultEl.textContent = result;
+        corsLiveResults.set(url, { html: false, text: result });
+        // Re-renderizar desde corsLiveResults (la fuente de verdad), en vez
+        // de actualizar directo el nodo `resultEl` capturado por closure --
+        // si el panel se refrescó automáticamente (cada 3s) MIENTRAS este
+        // fetch estaba en vuelo, ese nodo específico queda desconectado del
+        // documento (el refresco reconstruye el HTML desde cero). Escribirle
+        // directo seguía guardando el dato bien, pero no se veía en pantalla
+        // hasta el siguiente ciclo de refresco -- hasta 3s de demora
+        // silenciosa. Re-renderizar acá lo refleja al instante, sin
+        // depender de que esa referencia siga siendo válida.
+        renderEndpoints();
       } catch (err) {
         // Cualquier error inesperado (no solo los de fetch) ahora se ve acá
         // en vez de dejar el botón colgado en "Probando…" para siempre.
-        resultEl.textContent = `Error inesperado: ${err.message}`;
+        const msg = `Error inesperado: ${err.message}`;
+        corsLiveResults.set(url, { html: false, text: msg });
+        renderEndpoints();
       }
     });
   });
@@ -669,6 +1048,7 @@ function renderEndpoints() {
       document.getElementById("cli-section").scrollIntoView({ behavior: "smooth" });
     });
   });
+  wireLoadMoreButton(el, "endpoints", renderEndpoints);
 }
 
 function cssEscape(str) {
@@ -736,8 +1116,9 @@ function isReflectionConfirmed(param, sources) {
 
 function renderParams() {
   const el = document.getElementById("params-list");
-  const entries = Object.entries(currentData.params || {});
-  if (!entries.length) return (el.innerHTML = `<div class="empty">Sin parámetros clasificados aún.</div>`);
+  const allEntries = Object.entries(currentData.params || {});
+  if (!allEntries.length) return (el.innerHTML = `<div class="empty">Sin parámetros clasificados aún.</div>`);
+  const entries = allEntries.slice(0, getVisibleCount("params"));
 
   el.innerHTML = entries
     .map(([param, val]) => {
@@ -769,7 +1150,7 @@ function renderParams() {
         ` : ""}
       </div>`;
     })
-    .join("");
+    .join("") + loadMoreButtonHtml("params", entries.length, allEntries.length);
 
   el.querySelectorAll(".row-head[data-kind='params']").forEach((head) => {
     head.addEventListener("click", () => {
@@ -778,6 +1159,7 @@ function renderParams() {
       renderParams();
     });
   });
+  wireLoadMoreButton(el, "params", renderParams);
 }
 
 function buildTestSpec(c) {
@@ -785,7 +1167,7 @@ function buildTestSpec(c) {
   const paramName = c.kind === "query" ? c.param : "id (segmento de path)";
   const exampleId = c.observedIds[0];
   const otherId = c.observedIds.find((id) => id !== exampleId) || "<otro ID observado o consecutivo>";
-  const endpointDisplay = c.template.replace("{id}", exampleId);
+  const endpointDisplay = c.template.replaceAll("{id}", exampleId);
   return [
     `Endpoint:`,
     `${method} ${endpointDisplay}`,
@@ -812,14 +1194,20 @@ function buildTestSpec(c) {
 // se necesita pegar ahí para arrancar a probar).
 function buildBurpRequest(c) {
   const exampleId = c.observedIds[0];
-  const url = c.template.replace("{id}", exampleId);
+  // Se chequea la plantilla ORIGINAL (antes de reemplazar) para saber si
+  // tiene más de un segmento {id} -- antes se chequeaba el resultado ya
+  // reemplazado con un simple .replace(), que solo sustituía el PRIMERO,
+  // así que esta misma condición coincidía por accidente con el bug en
+  // vez de reflejar la plantilla real.
+  const hasMultipleIds = (c.template.match(/\{id\}/g) || []).length > 1;
+  const url = c.template.replaceAll("{id}", exampleId);
   let u;
   try {
     u = new URL(url);
   } catch {
     return `GET ${url} HTTP/1.1`;
   }
-  return [`GET ${u.pathname}${u.search} HTTP/1.1`, `Host: ${u.host}`, `Cookie: <tu sesión actual>`, ``, `# Cambia el ID (${exampleId}) por otro observado, o por ${u.pathname.includes("{id}") ? "un consecutivo" : "un valor ajeno"}, y compará la respuesta con otra sesión.`].join("\n");
+  return [`GET ${u.pathname}${u.search} HTTP/1.1`, `Host: ${u.host}`, `Cookie: <tu sesión actual>`, ``, `# Cambia el ID (${exampleId}) por otro observado, o por ${hasMultipleIds ? "un consecutivo" : "un valor ajeno"}, y compará la respuesta con otra sesión.`].join("\n");
 }
 
 function renderIdor() {
@@ -829,7 +1217,7 @@ function renderIdor() {
   el.innerHTML = entries
     .map((c, i) => {
       const isOpen = expanded.idor.has(c.template);
-      const exampleUrl = c.template.replace("{id}", c.observedIds[0]);
+      const exampleUrl = c.template.replaceAll("{id}", c.observedIds[0]);
       return `<div class="row">
       <div class="row-head" style="display:flex;justify-content:space-between;align-items:center">
         <span class="title mono">🔎 ${escapeHtml(exampleUrl)}</span>
@@ -875,11 +1263,21 @@ function renderIdor() {
 
   el.querySelectorAll(".btn-copy-burp").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const c = entries[Number(btn.dataset.idx)];
+      const idx = btn.dataset.idx;
+      const c = entries[Number(idx)];
       try {
         await navigator.clipboard.writeText(buildBurpRequest(c));
-        btn.textContent = "Copiado ✓ (pegalo en Repeater)";
-        setTimeout(() => (btn.textContent = "Enviar a Burp (copiar)"), 2000);
+        // Re-consultar el botón por su data-idx en vez de reusar la
+        // referencia capturada por closure -- si el panel se refrescó
+        // mientras el clipboard.writeText estaba en vuelo (ventana
+        // minúscula pero real), ese nodo puede haber quedado desconectado
+        // del documento; la copia se hace igual, pero el "Copiado ✓" no
+        // se vería. Mismo patrón que el fix de "Probar CORS ahora".
+        const liveBtn = el.querySelector(`.btn-copy-burp[data-idx="${idx}"]`);
+        if (liveBtn) {
+          liveBtn.textContent = "Copiado ✓ (pegalo en Repeater)";
+          setTimeout(() => (liveBtn.textContent = "Enviar a Burp (copiar)"), 2000);
+        }
       } catch {
         // clipboard puede fallar sin permiso de foco; no rompe el resto del panel
       }
@@ -911,7 +1309,7 @@ function renderIdor() {
       const c = entries[Number(btn.dataset.idx)];
       const idx = btn.dataset.idx;
       const resultEl = el.querySelector(`.idor-test-result[data-idx="${idx}"]`);
-      const exampleUrl = c.template.replace("{id}", c.observedIds[0]);
+      const exampleUrl = c.template.replaceAll("{id}", c.observedIds[0]);
       const blocked = checkActiveActionAllowed(exampleUrl);
       if (blocked) {
         resultEl.innerHTML = `<div class="scope-warning">${escapeHtml(blocked)}</div>`;
@@ -1108,6 +1506,12 @@ function renderSourceMaps() {
       ev.stopPropagation();
       const idx = Number(btn.dataset.smapIdx);
       const mapUrl = maps[idx].mapUrl;
+      // Capturado ANTES del await: currentData/currentDomain son variables
+      // de módulo que se REASIGNAN si el usuario cambia de dominio mientras
+      // este fetch está en vuelo -- sin esto, el resultado (cuando por fin
+      // llega) se escribiría en el dominio que esté activo EN ESE MOMENTO,
+      // no en el dominio donde se disparó la verificación.
+      const targetDomain = currentDomain;
       const resultEl = el.querySelector(`.smap-verify-result[data-smap-idx="${idx}"]`);
       btn.disabled = true;
       resultEl.textContent = "Verificando…";
@@ -1115,6 +1519,19 @@ function renderSourceMaps() {
       if (result.error) {
         resultEl.innerHTML = `<div class="scope-warning">${escapeHtml(result.error)}</div>`;
         btn.disabled = false;
+        return;
+      }
+      if (currentDomain !== targetDomain) {
+        // El usuario cambió de dominio mientras la verificación corría. El
+        // resultado pertenece al dominio ORIGINAL -- se escribe directo a
+        // su clave de storage, sin tocar currentData (que ahora es de otro
+        // dominio) ni disparar un re-render de la pestaña equivocada.
+        const targetKey = domainKey(targetDomain);
+        const res = await ext.storage.local.get(targetKey);
+        const targetData = res[targetKey] || emptyData(targetDomain);
+        targetData.sourceMaps = targetData.sourceMaps || {};
+        targetData.sourceMaps[mapUrl] = { ...targetData.sourceMaps[mapUrl], verified: true, ...result };
+        await ext.storage.local.set({ [targetKey]: targetData });
         return;
       }
       currentData.sourceMaps[mapUrl] = { ...currentData.sourceMaps[mapUrl], verified: true, ...result };
@@ -1222,7 +1639,7 @@ function gqlListSection(title, items, renderItem, emptyText) {
 }
 
 function renderGraphQLSchemaAnalysis(a) {
-  const fieldRow = (f) => `<div class="mono" style="padding:1px 0">${escapeHtml(f.name)}${f.args?.length ? `(${f.args.map((ar) => `${ar.name}: ${ar.type}`).join(", ")})` : "()"}: ${escapeHtml(f.returnType)}${f.looksPrivileged ? ` <span class="badge high">privilegiada?</span>` : ""}</div>`;
+  const fieldRow = (f) => `<div class="mono" style="padding:1px 0">${escapeHtml(f.name || "(sin nombre)")}${f.args?.length ? `(${f.args.map((ar) => `${ar.name}: ${ar.type}`).join(", ")})` : "()"}: ${escapeHtml(f.returnType)}${f.looksPrivileged ? ` <span class="badge high">privilegiada?</span>` : ""}</div>`;
 
   return `
     <div class="detail cors-card">
@@ -1283,8 +1700,6 @@ function renderGraphQLSchemaAnalysis(a) {
     </div>
   `;
 }
-
-// ---- WebSocket: conexiones detectadas, volumen real, muestras de mensajes -
 
 // ---- Fingerprinting de tecnología: headers, cookies, DOM y globales JS ----
 
@@ -1369,15 +1784,59 @@ function renderChains() {
   }
   el.innerHTML = chains
     .map(
-      (c) => `<div class="row">
+      (c, i) => `<div class="row">
         <div style="display:flex;justify-content:space-between;align-items:flex-start">
           <b>${escapeHtml(c.title)}</b>
           ${sevBadge(c.severity)}
         </div>
         <div class="hint" style="margin-top:6px">${escapeHtml(c.description)}</div>
+        <div class="detail-actions" style="margin-top:6px">
+          <button class="btn-create-finding-chain" data-idx="${i}">Crear hallazgo</button>
+        </div>
       </div>`
     )
     .join("");
+
+  el.querySelectorAll(".btn-create-finding-chain").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const c = chains[Number(btn.dataset.idx)];
+      // Las cadenas son hipótesis de encadenamiento, no un tipo de hallazgo
+      // con checklist propio en VALIDATION_CHECKLISTS -- se arma un
+      // checklist genérico de "qué falta demostrar" apropiado para
+      // cualquier cadena: confirmar CADA señal por separado antes de
+      // asumir que se conectan de verdad.
+      const checklist = [
+        "Confirmada la primera señal de forma independiente (no solo observada pasivamente)",
+        "Confirmada la segunda señal de forma independiente",
+        "Probada la combinación real (no asumir que conectan solo porque coincidieron en la sesión)",
+        "Evaluado el impacto real de la cadena completa, no solo de cada parte por separado",
+      ].map((i) => `☐ ${i}`).join("\n");
+      currentData.notes = currentData.notes || [];
+      currentData.notes.unshift({
+        title: `Cadena sugerida: ${c.title}`,
+        severity: sevBadgeToNoteSeverity(c.severity),
+        body: `${c.description}\n\nQué falta demostrar:\n${checklist}`,
+        createdAt: Date.now(),
+      });
+      saveCurrent();
+      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+      document.querySelectorAll(".tab-content").forEach((tc) => tc.classList.remove("active"));
+      document.querySelector(".tab-btn[data-tab='notes']").classList.add("active");
+      document.getElementById("tab-notes").classList.add("active");
+      render();
+    });
+  });
+}
+
+// Las cadenas usan la escala de severidad interna (high/medium/low/info,
+// minúscula, la misma que sevBadge) -- las notas usan la escala del
+// selector del formulario (Critical/High/Medium/Low/Informational,
+// capitalizada). Este mapeo evita escribir "high" literal en el campo
+// severity de una nota, que no matchearía ninguna opción real del select
+// ni la tabla de traducción a HackerOne/Bugcrowd/Intigriti.
+function sevBadgeToNoteSeverity(sev) {
+  const map = { critical: "Critical", high: "High", medium: "Medium", low: "Low", info: "Informational" };
+  return map[sev] || "Medium";
 }
 
 function renderTech() {
@@ -1395,7 +1854,13 @@ function renderTech() {
     byCategory[t.category].push(t);
   }
 
-  const confBadge = (c) => (c >= 85 ? "high" : c >= 60 ? "med" : "info");
+  // Antes devolvía "med" -- el CSS define .badge.medium, no .badge.med, así
+  // que ese caso nunca matcheaba ninguna regla y se veía sin color (blanco
+  // plano). Corregido a los 3 nombres de clase reales, con los 3 rangos
+  // pedidos: 80-100% alta confianza, 50-79% media, 1-49% baja.
+  const confBadge = (c) => (c >= 80 ? "high" : c >= 50 ? "medium" : "low");
+
+  expanded.tech = expanded.tech || new Set();
 
   el.innerHTML = Object.entries(byCategory)
     .sort(([, a], [, b]) => Math.max(...b.map((t) => t.confidence)) - Math.max(...a.map((t) => t.confidence)))
@@ -1404,65 +1869,31 @@ function renderTech() {
         <b>${escapeHtml(category)}</b>
         ${items
           .sort((a, b) => b.confidence - a.confidence)
-          .map(
-            (t) => `<div class="row" style="margin-top:6px">
-              <span class="badge ${confBadge(t.confidence)}">${t.confidence}%</span> <b>${escapeHtml(t.name)}</b>
-              <div class="hint" style="margin-top:2px">${t.evidence.map(escapeHtml).join(" · ")}</div>
-            </div>`
-          )
+          .map((t) => {
+            const isOpen = expanded.tech.has(t.name);
+            const count = t.evidence.length;
+            const expandable = count > 2; // pocas evidencias no necesitan expandirse
+            return `<div class="row" style="margin-top:6px">
+              <div class="tech-row-head" data-tech-key="${escapeHtml(t.name)}" style="cursor:${expandable ? "pointer" : "default"};display:flex;justify-content:space-between;align-items:flex-start">
+                <span><span class="badge ${confBadge(t.confidence)}">${t.confidence}%</span> <b>${escapeHtml(t.name)}</b></span>
+                ${expandable ? `<span class="hint">${isOpen ? "▲ contraer" : `▼ ${count} evidencias (doble clic)`}</span>` : ""}
+              </div>
+              ${isOpen
+                ? `<pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;max-height:220px;overflow-y:auto;white-space:pre-wrap;margin-top:4px">${t.evidence.map(escapeHtml).join("\n")}</pre>`
+                : `<div class="hint" style="margin-top:2px">${t.evidence.slice(0, 2).map(escapeHtml).join(" · ")}${count > 2 ? ` · +${count - 2} más` : ""}</div>`
+              }
+            </div>`;
+          })
           .join("")}
       </div>
     `)
     .join("");
-}
 
-function renderWebSocket() {
-  const el = document.getElementById("websocket-list");
-  if (!el) return;
-  const conns = Object.entries(currentData.websockets || {});
-  if (!conns.length) {
-    el.innerHTML = `<div class="empty">Sin conexiones WebSocket detectadas aún.</div>`;
-    return;
-  }
-
-  el.innerHTML = conns
-    .map(([key, ws]) => {
-      const isOpen = expanded.websocket?.has(key);
-      const isClosed = ws.lastCloseCode != null;
-      const outOfScope = ws.inScope === false;
-      return `<div class="row ${outOfScope ? "out-of-scope" : ""}">
-        <div class="row-head" data-ws-key="${escapeHtml(key)}" style="cursor:pointer;display:flex;justify-content:space-between">
-          <span>
-            <span class="badge ${isClosed ? "med" : "info"}">${isClosed ? "cerrada" : "activa/observada"}</span>
-            <b class="mono">${escapeHtml(ws.url)}</b>
-            ${outOfScope ? `<span class="badge critical">fuera de scope</span>` : ""}
-          </span>
-          <span class="hint">${isOpen ? "▲" : "▼"}</span>
-        </div>
-        <div class="hint">conexiones: ${ws.connections} · mensajes recibidos: ${ws.messagesIn} · mensajes enviados: ${ws.messagesOut} · último: ${new Date(ws.lastSeen).toLocaleTimeString()}</div>
-        ${isClosed ? `<div class="hint">último cierre: código ${ws.lastCloseCode}${ws.lastCloseReason ? ` — ${escapeHtml(ws.lastCloseReason)}` : ""}</div>` : ""}
-        ${isOpen ? `
-          <div class="detail">
-            <div class="detail-block">
-              <b>Muestras de mensajes recibidos (últimas ${ws.sampleMessagesIn.length} de ${ws.messagesIn} reales)</b>
-              ${ws.sampleMessagesIn.length ? ws.sampleMessagesIn.slice().reverse().map((m) => `<pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;margin-top:4px">${m.binary ? "[binario] " : ""}${escapeHtml(m.data)}</pre>`).join("") : `<div class="hint">Sin muestras de texto capturadas todavía.</div>`}
-            </div>
-            <div class="detail-block">
-              <b>Muestras de mensajes enviados (últimas ${ws.sampleMessagesOut.length} de ${ws.messagesOut} reales)</b>
-              ${ws.sampleMessagesOut.length ? ws.sampleMessagesOut.slice().reverse().map((m) => `<pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;margin-top:4px">${m.binary ? "[binario] " : ""}${escapeHtml(m.data)}</pre>`).join("") : `<div class="hint">Sin muestras de texto capturadas todavía.</div>`}
-            </div>
-          </div>
-        ` : ""}
-      </div>`;
-    })
-    .join("");
-
-  el.querySelectorAll(".row-head[data-ws-key]").forEach((head) => {
-    head.addEventListener("click", () => {
-      const key = head.dataset.wsKey;
-      expanded.websocket = expanded.websocket || new Set();
-      expanded.websocket.has(key) ? expanded.websocket.delete(key) : expanded.websocket.add(key);
-      renderWebSocket();
+  el.querySelectorAll(".tech-row-head[data-tech-key]").forEach((head) => {
+    head.addEventListener("dblclick", () => {
+      const key = head.dataset.techKey;
+      expanded.tech.has(key) ? expanded.tech.delete(key) : expanded.tech.add(key);
+      renderTech();
     });
   });
 }
@@ -1567,13 +1998,65 @@ function renderGraphQL() {
   });
 }
 
+// ---- Aprendizaje de falsos positivos: si el mismo TIPO de hallazgo (type +
+// directive, sin importar la URL puntual) se marcó falso positivo varias
+// veces, se sugiere una regla de supresión automática. No es un sistema
+// paralelo -- una regla aplicada simplemente auto-marca como "falso
+// positivo" (mismo dismissedFindings de siempre) cualquier hallazgo nuevo
+// que matchee el patrón, reusando el 100% de la lógica de filtrado/render
+// que ya existe.
+const SUPPRESSION_SUGGESTION_THRESHOLD = 3;
+
+function findingPatternKey(type, directive) {
+  return `${type}::${directive}`;
+}
+
+function computeSuppressionSuggestions(allFindings, dismissed, existingRules) {
+  const alreadyRuled = new Set((existingRules || []).map((r) => findingPatternKey(r.type, r.directive)));
+  const counts = {};
+  for (const f of allFindings) {
+    if (!dismissed[corsFindingKey(f)]) continue;
+    const pk = findingPatternKey(f.type, f.directive);
+    if (alreadyRuled.has(pk)) continue;
+    counts[pk] = counts[pk] || { type: f.type, directive: f.directive, count: 0 };
+    counts[pk].count++;
+  }
+  return Object.values(counts).filter((c) => c.count >= SUPPRESSION_SUGGESTION_THRESHOLD);
+}
+
 function renderCors() {
   const el = document.getElementById("cors-list");
   const all = [...(currentData.corsFindings || []), ...(currentData.cspFindings || []), ...(currentData.securityHeaderFindings || []), ...(currentData.oauthFindings || [])];
   if (!all.length) return (el.innerHTML = `<div class="empty">Sin hallazgos CORS/CSP aún.</div>`);
   const dismissed = currentData.dismissedFindings || {};
+  currentData.suppressionRules = currentData.suppressionRules || [];
 
-  el.innerHTML = all
+  // Aplicar reglas ya creadas: cualquier hallazgo nuevo que matchee una
+  // regla existente se marca "falso positivo" automáticamente, sin que el
+  // usuario tenga que volver a marcarlo a mano cada vez que aparece.
+  let rulesApplied = false;
+  for (const f of all) {
+    const key = corsFindingKey(f);
+    if (dismissed[key]) continue;
+    if (currentData.suppressionRules.some((r) => r.type === f.type && r.directive === f.directive)) {
+      dismissed[key] = true;
+      rulesApplied = true;
+    }
+  }
+  if (rulesApplied) saveCurrent();
+
+  const suggestions = computeSuppressionSuggestions(all, dismissed, currentData.suppressionRules);
+  const suggestionsHtml = suggestions
+    .map(
+      (s) => `<div class="row" style="border-color:var(--info)">
+        <span class="hint">Marcaste ${s.count} hallazgos de tipo "${escapeHtml(s.type)}: ${escapeHtml(s.directive)}" como falso positivo.</span>
+        <button class="btn-suppress-pattern" data-type="${escapeHtml(s.type)}" data-directive="${escapeHtml(s.directive)}" style="margin-left:8px">Suprimir automáticamente este tipo</button>
+      </div>`
+    )
+    .join("");
+
+  el.innerHTML = suggestionsHtml + all
+
     .map((f, i) => {
       const key = corsFindingKey(f);
       const isOpen = expanded.cors?.has(key);
@@ -1661,11 +2144,17 @@ function renderCors() {
 
   el.querySelectorAll(".btn-cors-copy").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const f = all[Number(btn.dataset.corsIdx)];
+      const idx = btn.dataset.corsIdx;
+      const f = all[Number(idx)];
       try {
         await navigator.clipboard.writeText(buildCorsEvidenceText(f));
-        btn.textContent = "Copiado ✓";
-        setTimeout(() => (btn.textContent = "Copiar evidencia"), 1500);
+        // Mismo motivo que btn-copy-burp: re-consultar por data-cors-idx
+        // en vez de reusar la referencia capturada por closure.
+        const liveBtn = el.querySelector(`.btn-cors-copy[data-cors-idx="${idx}"]`);
+        if (liveBtn) {
+          liveBtn.textContent = "Copiado ✓";
+          setTimeout(() => (liveBtn.textContent = "Copiar evidencia"), 1500);
+        }
       } catch {}
     });
   });
@@ -1700,6 +2189,15 @@ function renderCors() {
       renderCors();
     });
   });
+
+  el.querySelectorAll(".btn-suppress-pattern").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      currentData.suppressionRules = currentData.suppressionRules || [];
+      currentData.suppressionRules.push({ type: btn.dataset.type, directive: btn.dataset.directive, createdAt: Date.now() });
+      await saveCurrent();
+      renderCors();
+    });
+  });
 }
 
 function renderNotes() {
@@ -1707,20 +2205,43 @@ function renderNotes() {
   const notes = currentData.notes || [];
   if (!notes.length) return (el.innerHTML = `<div class="empty">Sin hallazgos guardados aún.</div>`);
   el.innerHTML = notes
-    .map((n) => {
+    .map((n, i) => {
       const platformLine = severityPlatformLine(n.severity);
       return `<div class="row">
-      <span class="title">${escapeHtml(n.title)}</span> ${sevBadge(n.severity)}
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span><span class="title">${escapeHtml(n.title)}</span> ${sevBadge(n.severity)}</span>
+        <button class="btn-delete-note" data-idx="${i}" title="Eliminar esta nota">Eliminar</button>
+      </div>
       ${platformLine ? `<div class="hint" style="margin-top:2px">${escapeHtml(platformLine)}</div>` : ""}
       <div style="white-space:pre-wrap;margin-top:4px">${escapeHtml(n.body)}</div>
       <div class="hint">${new Date(n.createdAt).toLocaleString()}</div>
     </div>`;
     })
     .join("");
+
+  // Antes no existía ninguna forma de borrar una nota individual -- solo
+  // "Limpiar dominio" completo, que se lleva TODO (endpoints, secretos,
+  // etc.), no solo las notas. Con el volumen que se puede generar solo
+  // con "Crear hallazgo" desde IDOR/Cadenas, era una limitación real.
+  el.querySelectorAll(".btn-delete-note").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const idx = Number(btn.dataset.idx);
+      if (!confirm("¿Eliminar esta nota? No se puede deshacer.")) return;
+      currentData.notes.splice(idx, 1);
+      await saveCurrent();
+      renderNotes();
+    });
+  });
 }
 
 async function saveCurrent() {
-  await ext.storage.local.set({ [domainKey(currentDomain)]: currentData });
+  // entityGraph se excluye a propósito: background.js es el único dueño de
+  // esa clave separada, el panel nunca la modifica -- si se incluyera acá,
+  // se reintroduciría el blob grande en la clave principal (desperdiciando
+  // el ahorro) o se pisaría la clave separada con una copia potencialmente
+  // vieja.
+  const { entityGraph, ...rest } = currentData;
+  await ext.storage.local.set({ [domainKey(currentDomain)]: rest });
 }
 
 document.getElementById("refresh").addEventListener("click", async (ev) => {
@@ -1748,6 +2269,11 @@ document.getElementById("clear").addEventListener("click", async () => {
     if (!confirm(`¿Limpiar todos los datos capturados de ${currentDomain}?`)) return;
     currentData = emptyData(currentDomain);
     await saveCurrent();
+    // entityGraph y el snapshot manual viven en sus propias claves (ver
+    // entityGraphKey/snapshotKey) -- saveCurrent() no las toca a
+    // propósito, así que hay que borrarlas explícitamente acá o quedarían
+    // huérfanas (entityGraph potencialmente varios MB sin limpiar nunca).
+    await ext.storage.local.remove([entityGraphKey(currentDomain), snapshotKey(currentDomain)]);
     render();
   } catch (err) {
     showPanelError(`Error al limpiar: ${err.message} — si dice "QUOTA_BYTES", el storage está lleno; probá "Limpiar TODOS los dominios".`, err.stack);
@@ -1792,6 +2318,78 @@ document.getElementById("export").addEventListener("click", async () => {
   }
 });
 
+// ---- Exportar/importar sesión completa: no el reporte formateado, sino
+// TODOS los datos crudos del dominio (incluido entityGraph) -- para
+// respaldar el trabajo o continuarlo en otra máquina. La importación
+// reusa mergeLegacyDomainData(), la misma función ya construida y probada
+// para la fusión de "www." -- fusionar una sesión importada es
+// exactamente el mismo problema: combinar datos de otro origen sin pisar
+// lo que ya está.
+document.getElementById("export-session")?.addEventListener("click", async () => {
+  const payload = { version: 1, domain: currentDomain, exportedAt: Date.now(), data: currentData };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const filename = `surface-hound-session-${currentDomain}-${Date.now()}.json`;
+  if (ext.downloads?.download) {
+    await ext.downloads.download({ url, filename });
+  } else {
+    window.open(url);
+  }
+});
+
+document.getElementById("import-session-btn")?.addEventListener("click", () => {
+  document.getElementById("import-session-file")?.click();
+});
+
+document.getElementById("import-session-file")?.addEventListener("change", async (ev) => {
+  const file = ev.target.files?.[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const payload = JSON.parse(text);
+    // No confiar ciegamente en que el archivo sea "nuestro" solo porque
+    // parseó como JSON -- se valida la forma mínima esperada antes de
+    // fusionar nada.
+    if (!payload || typeof payload !== "object" || !payload.data || !isPlainObject(payload.data) || !isPlainObject(payload.data.endpoints)) {
+      showPanelError("El archivo no tiene el formato esperado de una sesión de Surface Hound exportada.");
+      return;
+    }
+    const when = payload.exportedAt ? new Date(payload.exportedAt).toLocaleString() : "fecha desconocida";
+    if (!confirm(`¿Fusionar los datos de "${payload.domain || "dominio desconocido"}" (exportados ${when}) con lo que ya tenés en ${currentDomain}? Esto NO borra nada existente, solo agrega lo que falte.`)) {
+      return;
+    }
+    mergeLegacyDomainData(currentData, payload.data);
+    // Igual que en la migración de "www.": entityGraph se separa y se
+    // escribe explícito en su propia clave, ya que saveCurrent() lo
+    // excluye a propósito (background.js es su dueño normalmente, pero acá
+    // la fusión sí le agregó contenido nuevo que hay que persistir).
+    const { entityGraph, ...restData } = currentData;
+    await ext.storage.local.set({ [domainKey(currentDomain)]: restData, [entityGraphKey(currentDomain)]: entityGraph });
+    render();
+  } catch (e) {
+    showPanelError(`Error al importar la sesión: ${e.message}`, e.stack);
+  } finally {
+    ev.target.value = "";
+  }
+});
+
+// Neutraliza sintaxis estructural de Markdown (encabezados, separadores
+// horizontales) al INICIO de una línea dentro del cuerpo de una nota --
+// sin esto, una nota que por accidente tenga una línea "---" o "## algo"
+// (ej. pegando una respuesta HTTP cruda) es visualmente indistinguible de
+// la estructura propia del reporte, que también usa "---" como separador
+// entre notas y "##" como encabezado de cada una.
+function escapeMdStructural(text) {
+  return String(text ?? "")
+    .split("\n")
+    .map((line) => {
+      if (/^#{1,6}\s/.test(line)) return "\\" + line; // encabezado falso
+      if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line.trim())) return "\\" + line; // separador horizontal falso
+      return line;
+    })
+    .join("\n");
+}
+
 function buildReport() {
   const notes = currentData.notes || [];
   const footer = `\n---\n\n_Generado con Surface Hound — creado por Zuk4r1._\n`;
@@ -1802,7 +2400,8 @@ function buildReport() {
   }
   for (const n of notes) {
     const platformLine = severityPlatformLine(n.severity);
-    md += `## ${n.title}\n\n**Severity:** ${n.severity}${platformLine ? `\n\n**Traducción por plataforma:** ${platformLine}` : ""}\n\n**Summary / Steps to reproduce / Impact:**\n\n${n.body}\n\n---\n\n`;
+    const title = (n.title || "").trim() || "(sin título)";
+    md += `## ${title}\n\n**Severity:** ${n.severity}${platformLine ? `\n\n**Traducción por plataforma:** ${platformLine}` : ""}\n\n**Summary / Steps to reproduce / Impact:**\n\n${escapeMdStructural(n.body)}\n\n---\n\n`;
   }
   return md + footer;
 }
@@ -1878,8 +2477,18 @@ function ensureNativePort() {
 }
 
 function renderJobsError(msg) {
+  // Antes: cada llamada agregaba un cartel de error NUEVO al principio de
+  // la lista, sin sacar los anteriores. Como checkAgentStatus() reintenta
+  // conectar cada 15s de forma indefinida mientras el panel esté abierto
+  // (ver setInterval más abajo), y CADA intento fallido dispara este
+  // mismo error vía onDisconnect, el usuario terminaba viendo decenas de
+  // carteles idénticos apilados con solo tener el panel abierto un rato
+  // -- no hacía falta ni tocar "Ejecutar". Con uno solo alcanza para
+  // notificar: se reemplaza el anterior en vez de acumularse.
+  const existing = jobsListEl.querySelector(".native-host-error");
+  if (existing) existing.remove();
   const div = document.createElement("div");
-  div.className = "scope-warning";
+  div.className = "scope-warning native-host-error";
   div.textContent = msg;
   jobsListEl.prepend(div);
 }

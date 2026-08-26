@@ -330,11 +330,23 @@ def submit_job(msg):
     job_queue.put(job_id)
 
 
+FINISHED_STATUSES = {"done", "error", "blocked", "cancelled"}
+
+
 def cancel_job(job_id):
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
             send_message({"job_id": job_id, "ok": False, "error": "job no encontrado"})
+            return
+        if job["status"] in FINISHED_STATUSES:
+            # Antes no se distinguía un job EN CURSO de uno que ya había
+            # terminado (naturalmente o cancelado antes) -- una cancelación
+            # que llegara tarde podía re-etiquetar como "cancelled" un job
+            # que ya había reportado éxito, si algo del lado de la UI volvía
+            # a consultar su estado después. Se rechaza explícitamente en
+            # vez de aceptar la cancelación sobre un job que ya no está vivo.
+            send_message({"job_id": job_id, "ok": False, "error": f"el job ya terminó (status: {job['status']}), no se puede cancelar"})
             return
         job["status"] = "cancelled"
         proc = job.get("process")
