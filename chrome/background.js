@@ -334,6 +334,25 @@ function looksLikeGraphQLPayload(bodyText) {
 // Soporta batching (GraphQL permite mandar un array de operaciones en un
 // solo request -- es del propio checklist de reconocimiento GraphQL, no
 // un caso raro).
+// Hash simple y rápido (djb2) para el texto de una query anónima -- ver uso
+// en recordGraphQLOperations: sin esto, TODAS las queries anónimas de un
+// mismo endpoint comparten literalmente el string "(anónima)" como parte
+// de la clave de deduplicación, así que queries con contenido totalmente
+// distinto (una pide "users", otra "orders", otra "invoices") colapsaban
+// en una sola entrada -- se perdía la visibilidad de todas menos la
+// primera. Se normaliza el whitespace antes de hashear para que la MISMA
+// query con formato ligeramente distinto (espacios, saltos de línea)
+// siga colapsando correctamente entre sí, que es el comportamiento
+// deseado para polling/refetch.
+function simpleHash(str) {
+  const normalized = str.replace(/\s+/g, " ").trim();
+  let hash = 5381;
+  for (let i = 0; i < normalized.length; i++) {
+    hash = ((hash << 5) + hash + normalized.charCodeAt(i)) | 0;
+  }
+  return (hash >>> 0).toString(36);
+}
+
 function parseGraphQLOperations(bodyText) {
   if (!looksLikeGraphQLPayload(bodyText)) return [];
   let parsed;
@@ -353,7 +372,7 @@ function parseGraphQLOperations(bodyText) {
     const operationType = match ? match[1].toLowerCase() : "query";
     const operationName = (match && match[2]) || item.operationName || null;
     const hasIntrospectionKeyword = /__schema\b|__type\b/.test(queryText);
-    ops.push({ operationType, operationName, hasIntrospectionKeyword });
+    ops.push({ operationType, operationName, hasIntrospectionKeyword, queryHash: operationName ? null : simpleHash(queryText) });
   }
   return ops;
 }
@@ -382,12 +401,17 @@ function recordGraphQLOperations(data, url, method, ops) {
     // refetch, etc.) se incrementa un contador en vez de acumular entradas
     // nuevas sin límite -- esto es lo que evita que el storage crezca sin
     // control en una sesión larga con una app que hace polling constante.
-    const opKey = `${method} ${url.split("?")[0]}::${op.operationType}:${op.operationName || "(anónima)"}`;
+    // Para queries ANÓNIMAS (sin operationName), se usa el hash del texto
+    // de la query en vez del literal "(anónima)" -- si no, dos queries
+    // anónimas con contenido totalmente distinto colapsarían en la misma
+    // clave, perdiendo visibilidad de una de las dos.
+    const opKey = `${method} ${url.split("?")[0]}::${op.operationType}:${op.operationName || `(anónima:${op.queryHash})`}`;
     if (!data.graphqlOperations[opKey]) {
       data.graphqlOperations[opKey] = {
         endpoint: url, method,
         operationType: op.operationType,
         operationName: op.operationName,
+        queryHash: op.queryHash, // solo para anonimas -- ver display en panel-core.js
         hits: 0,
         firstSeen: now,
         introspectionRequested: false,
@@ -1643,7 +1667,23 @@ ext.webRequest.onHeadersReceived.addListener(
       recordTechFindings(data, techFindings);
       if (is429) {
         const epKey = `${(details.method || "GET").toUpperCase()} ${details.url.split("?")[0]}`;
-        if (data.endpoints[epKey]) data.endpoints[epKey].saw429 = true;
+        if (!data.endpoints[epKey]) {
+          // Mismo problema que hasAuth tenía antes de corregirse: onHeadersReceived
+          // puede llegar al lock del dominio antes de que onBeforeRequest haya
+          // terminado de crear el endpoint (éste hace un await extra a
+          // getScopeConfig() antes de llegar ahí). Sin este stub, saw429 se
+          // perdía en silencio -- y esa pérdida es peligrosa acá en particular,
+          // porque "Posible ausencia de rate limiting" se basa exactamente en
+          // NO haber visto nunca un 429: un 429 real que se pierde por esta
+          // carrera generaría un falso positivo del hallazgo.
+          const scope = await getScopeConfig();
+          data.endpoints[epKey] = {
+            url: details.url, method: (details.method || "GET").toUpperCase(),
+            firstSeen: Date.now(), lastSeen: Date.now(), hits: 0,
+            inScope: isInScope(realHostname(details.url) || domain, scope),
+          };
+        }
+        data.endpoints[epKey].saw429 = true;
       }
       await saveDomainData(domain, data);
     });

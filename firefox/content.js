@@ -132,7 +132,17 @@
   // que NO deben reportarse como hallazgo aunque calcen con el regex.
   const KNOWN_BENIGN_SECRETS = new Set([
     "sk_test_4eC39HqLyjWDarjtT1zdp7dc", // clave de ejemplo de la documentación oficial de Stripe
+    "AKIAIOSFODNN7EXAMPLE", // access key ID de ejemplo de la documentación oficial de AWS
   ]);
+
+  // La entropía sola no distingue "estructura variada" de "aleatoriedad
+  // real" -- placeholders comunes en documentación como "YOUR_API_KEY_HERE"
+  // o "REPLACE_WITH_YOUR_TOKEN" tienen suficiente variedad de caracteres
+  // para superar el umbral de entropía sin ser secretos reales. Se agrega
+  // este chequeo de marcadores textuales conocidos, en paralelo al de
+  // entropía (además, no en vez de) -- la entropía sigue descartando los
+  // casos degenerados ("xxxxxxxx") que este chequeo de palabras no cubre.
+  const PLACEHOLDER_MARKER_RE = /YOUR[_-]?(API[_-]?)?(KEY|TOKEN|SECRET)|PLACEHOLDER|REPLACE[_-]?(THIS|WITH|ME)|INSERT[_-]?YOUR|ENTER[_-]?YOUR|CHANGE[_-]?ME|DUMMY|SAMPLE[_-]?(KEY|TOKEN|SECRET)|_HERE$/i;
 
   function shannonEntropy(str) {
     const freq = {};
@@ -153,11 +163,13 @@
       for (const m of new Set(matches)) {
         if (KNOWN_BENIGN_SECRETS.has(m)) continue;
         // El patrón genérico es el único con alto riesgo de placeholders/valores
-        // de relleno (ej. "xxxxxxxxxxxxxxxx"); se filtra por entropía.
+        // de relleno (ej. "xxxxxxxxxxxxxxxx" o "YOUR_API_KEY_HERE"); se filtra
+        // por entropía Y por marcador textual conocido.
         if (p.confidence <= 55) {
           const valueMatch = m.match(/["']([A-Za-z0-9_\-]{20,})["']$/);
           const value = valueMatch ? valueMatch[1] : m;
           if (shannonEntropy(value) < 3.0) continue;
+          if (PLACEHOLDER_MARKER_RE.test(value)) continue;
         }
         secrets.push({
           name: p.name,

@@ -334,6 +334,26 @@ function renderStatusLine() {
     <span>AGENT: <b style="color:${agentColor}">${agentLabel}</b></span>
     <span style="margin-left:auto;color:var(--accent);text-shadow:var(--glow)">🕵️‍♂️ Zuk4r1</span>
   `;
+
+  // El scope es GLOBAL -- una sola configuración para toda la extensión,
+  // no una por dominio -- y persiste a propósito entre reinicios del
+  // navegador (chrome.storage.local existe justamente para eso, para no
+  // perder la configuración de un engagement de varios días). Si el
+  // dominio que se está mirando ahora no matchea NINGÚN patrón del scope
+  // activo, es fácil pensar que hay un bug ("¿por qué todo aparece fuera
+  // de scope?") cuando en realidad es el scope de un programa DISTINTO
+  // que quedó activo de una sesión anterior. Se avisa explícitamente acá
+  // para que no pase desapercibido.
+  const warningEl = document.getElementById("scope-domain-mismatch-warning");
+  if (warningEl) {
+    const domainCovered = !scopeOn || !currentDomain || isInScope(currentDomain, currentScope) !== false;
+    if (scopeOn && currentDomain && !domainCovered) {
+      warningEl.style.display = "block";
+      warningEl.textContent = `⚠ El scope activo ("${currentScope.programName || "sin nombre"}") no cubre a ${currentDomain} -- ¿es de otro programa? Revisá la pestaña Scope antes de dar nada por "fuera de scope" acá.`;
+    } else {
+      warningEl.style.display = "none";
+    }
+  }
 }
 
 document.querySelectorAll(".mode-btn").forEach((btn) => {
@@ -689,7 +709,6 @@ function escapeHtml(str) {
 function render() {
   try {
     renderMapa();
-    renderRateLimitFindings();
     renderEndpoints();
     renderParams();
     renderIdor();
@@ -697,6 +716,7 @@ function render() {
     renderJwt();
     renderSourceMaps();
     renderSecrets();
+    renderRateLimitFindings();
     renderCors();
     renderGraphQL();
     renderTech();
@@ -870,7 +890,12 @@ function renderEntidades() {
     return;
   }
 
-  const nodes = Object.entries(graph.nodes).sort((a, b) => b[1].count - a[1].count);
+  const allNodes = Object.entries(graph.nodes).sort((a, b) => b[1].count - a[1].count);
+  // Sin esto, un dominio con el volumen que ya permite MAX_ENTITY_NODES
+  // (3000) congelaba la pestaña varios segundos al abrirla -- Endpoints y
+  // Parámetros ya paginan con este mismo patrón, Entidades había quedado
+  // afuera al construirla.
+  const nodes = allNodes.slice(0, getVisibleCount("entidades"));
   el.innerHTML = nodes
     .map(([nodeId, node]) => {
       const related = Object.entries(graph.edges[nodeId] || {})
@@ -887,26 +912,35 @@ function renderEntidades() {
         ${node.urls?.length ? `<div class="hint" style="margin-top:6px">Visto en: ${node.urls.map((u) => `<div class="mono">${escapeHtml(u)}</div>`).join("")}</div>` : ""}
       </div>`;
     })
-    .join("");
+    .join("") + loadMoreButtonHtml("entidades", nodes.length, allNodes.length);
+  wireLoadMoreButton(el, "entidades", renderEntidades);
 }
 
 // ---- Endpoints: clic para expandir y ver params/CORS/CSP asociados + acciones ----
 
 // ---- Ausencia de rate limiting en endpoints sensibles (inferido pasivamente:
-// mismo endpoint pegado varias veces, nunca un 429) -----------------------
+// mismo endpoint pegado varias veces, nunca un 429) -- se muestra en la
+// pestaña CORS/CSP (no en Endpoints): Endpoints es el listado neutral de
+// tráfico capturado, sin ningún hallazgo con severidad; los hallazgos con
+// badge de severidad (CORS, CSP, headers, OAuth, y este) viven todos
+// juntos en CORS/CSP.
 
 const SENSITIVE_AUTH_PATH_RE = /\/(login|signin|sign-in|log-in|auth|authenticate|otp|verify(-otp)?|verification|2fa|mfa|reset-password|resetpassword|forgot-password|forgotpassword|password-reset|change-password)(\/|\?|$)/i;
 const RATE_LIMIT_HIT_THRESHOLD = 5;
 
-function renderRateLimitFindings() {
-  const el = document.getElementById("ratelimit-list");
-  if (!el) return;
-  const candidates = Object.values(currentData.endpoints || {}).filter((e) => {
+function getRateLimitCandidates() {
+  return Object.values(currentData.endpoints || {}).filter((e) => {
     if (e.hits < RATE_LIMIT_HIT_THRESHOLD || e.saw429) return false;
     let path = "";
     try { path = new URL(e.url).pathname; } catch { return false; }
     return SENSITIVE_AUTH_PATH_RE.test(path);
   });
+}
+
+function renderRateLimitFindings() {
+  const el = document.getElementById("ratelimit-list");
+  if (!el) return;
+  const candidates = getRateLimitCandidates();
   if (!candidates.length) return (el.innerHTML = "");
 
   el.innerHTML = `<div class="detail-block">
@@ -1597,13 +1631,23 @@ function buildCorsEvidenceText(f) {
 
 const GQL_TYPE_BADGE = { query: "info", mutation: "high", subscription: "med" };
 
+// Nombre a mostrar para una operación: si es anónima, incluye los
+// primeros caracteres del hash de su query -- sin esto, dos operaciones
+// anónimas de contenido distinto (ya separadas correctamente en storage
+// desde el fix de recordGraphQLOperations) se veían IGUALES en pantalla,
+// ambas como "(anónima)", sin forma de distinguirlas a simple vista.
+function graphqlOpDisplayName(op) {
+  if (op.operationName) return op.operationName;
+  return op.queryHash ? `(anónima:${op.queryHash.slice(0, 6)})` : "(anónima)";
+}
+
 function buildBflaSpec(op) {
   return [
     `Endpoint:`,
     `${op.method} ${op.endpoint}`,
     ``,
     `Operation:`,
-    `${op.operationType} ${op.operationName || "(anónima)"}`,
+    `${op.operationType} ${graphqlOpDisplayName(op)}`,
     ``,
     `Suggested test:`,
     `1. Repetí esta operación con una sesión de un usuario con MENOS privilegios que el actual (o de otro tenant/rol)`,
@@ -1954,7 +1998,7 @@ function renderGraphQL() {
         <div class="row-head" data-gql-key="${escapeHtml(key)}" style="cursor:pointer;display:flex;justify-content:space-between">
           <span>
             <span class="badge ${GQL_TYPE_BADGE[op.operationType] || "info"}">${escapeHtml(op.operationType)}</span>
-            <b>${escapeHtml(op.operationName || "(anónima)")}</b>
+            <b>${escapeHtml(graphqlOpDisplayName(op))}</b>
             ${isMutation ? `<span class="badge high" title="Autorización a nivel de operación -- rara vez se prueba a mano">BFLA candidate</span>` : ""}
             ${op.introspectionRequested ? `<span class="badge med">introspection solicitada</span>` : ""}
           </span>
@@ -2027,7 +2071,13 @@ function computeSuppressionSuggestions(allFindings, dismissed, existingRules) {
 function renderCors() {
   const el = document.getElementById("cors-list");
   const all = [...(currentData.corsFindings || []), ...(currentData.cspFindings || []), ...(currentData.securityHeaderFindings || []), ...(currentData.oauthFindings || [])];
-  if (!all.length) return (el.innerHTML = `<div class="empty">Sin hallazgos CORS/CSP aún.</div>`);
+  if (!all.length) {
+    // Si no hay hallazgos de CORS/CSP/headers/OAuth pero SÍ hay un hallazgo
+    // de rate limiting (se renderiza aparte, en #ratelimit-list, arriba de
+    // esta lista) -- dejar esto vacío en vez de mostrar "sin hallazgos",
+    // que quedaría contradictorio justo debajo de un hallazgo real.
+    return (el.innerHTML = getRateLimitCandidates().length ? "" : `<div class="empty">Sin hallazgos CORS/CSP aún.</div>`);
+  }
   const dismissed = currentData.dismissedFindings || {};
   currentData.suppressionRules = currentData.suppressionRules || [];
 

@@ -24,6 +24,7 @@
     </div>
   </header>
   <div id="status-line" class="status-line"></div>
+  <div id="scope-domain-mismatch-warning" class="scope-warning" style="display:none;margin:0 12px 8px 12px"></div>
 
   <nav class="tabs">
     <button class="tab-btn active" data-tab="mapa">Mapa</button>
@@ -47,7 +48,6 @@
       <div id="mapa-tree"></div>
     </section>
     <section id="tab-endpoints" class="tab-content">
-      <div id="ratelimit-list" style="margin-bottom:14px"></div>
       <div id="endpoints-list"></div>
 
       <details id="cli-section" style="margin-top:16px">
@@ -84,6 +84,7 @@
     </section>
     <section id="tab-cors" class="tab-content">
       <div class="hint" style="margin-bottom:8px">Hallazgos de CORS, CSP, headers de seguridad básicos (HSTS, X-Frame-Options, X-Content-Type-Options, Permissions-Policy), y flujos OAuth/OIDC (state/PKCE/redirect_uri) — reconocimiento estándar sobre el documento HTML principal, evitando ruido en respuestas de API/assets.</div>
+      <div id="ratelimit-list" style="margin-bottom:14px"></div>
       <div id="cors-list"></div>
     </section>
     <section id="tab-graphql" class="tab-content">
