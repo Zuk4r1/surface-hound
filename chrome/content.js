@@ -265,11 +265,37 @@
   // puede llamar directo a chrome.runtime, así que nos manda los eventos
   // por postMessage y nosotros (mundo aislado, con acceso a la API de
   // extensiones) los retransmitimos al background.
+  //
+  // event.source === window solo descarta mensajes de OTRAS ventanas/
+  // iframes -- no protege contra otro script corriendo en esta MISMA
+  // página (un ad, una librería de terceros comprometida, un XSS del
+  // propio sitio) que llame a window.postMessage con la misma propiedad
+  // __surfaceHoundNetEvent, inyectando hallazgos falsos (operaciones
+  // GraphQL inventadas, entidades correlacionadas fabricadas, etc.).
+  // Mitigación: se exige un token que network-interceptor.js escribe en un
+  // atributo del DOM (no por postMessage -- ese script corre en
+  // document_start y este en document_idle, un postMessage de una sola vez
+  // ahí se perdería sin que nadie lo escuche todavía). Se lee UNA vez acá,
+  // al arrancar, y se exige que cada netevent lo incluya. No es un secreto
+  // criptográficamente perfecto (cualquier otro script de la página puede
+  // leer el mismo atributo), pero eleva el ataque de "cualquier script
+  // genérico que adivine la propiedad __surfaceHoundNetEvent" a "requiere
+  // conocer este protocolo interno específico".
+  let pageToken = null;
+  try {
+    pageToken = document.documentElement.getAttribute("data-shx-t");
+  } catch {
+    // fail-closed: si no se puede leer el token, pageToken queda null y
+    // ningún netevent pasa la validación de abajo -- se pierde captura en
+    // vez de aceptar datos sin poder verificarlos.
+  }
+
   window.addEventListener("message", (event) => {
     try {
       if (event.source !== window) return;
       const data = event.data;
       if (!data || !data.__surfaceHoundNetEvent) return;
+      if (pageToken === null || data.token !== pageToken) return;
       safeSendMessage({ type: "shx:netevent", ...data });
     } catch (err) {
       if (!isContextInvalidatedError(err)) throw err;

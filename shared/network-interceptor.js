@@ -16,6 +16,31 @@
 // llamarse funciones entre sí directamente.
 
 (function () {
+  // Token de handshake por carga de página (ver content.js para el resto de
+  // la mitigación). Se escribe como atributo del DOM, NO como postMessage
+  // de una sola vez -- este script corre en document_start, pero content.js
+  // (que necesita leerlo) corre recién en document_idle; un postMessage
+  // disparado acá se perdería sin que nadie lo escuche todavía. Un atributo
+  // del DOM, en cambio, persiste: content.js lo lee cuando arranca, sin
+  // depender de ninguna carrera de timing entre ambos scripts.
+  //
+  // Esto no es un secreto criptográficamente perfecto (cualquier otro
+  // script de la página puede leer el mismo atributo tan pronto como
+  // nosotros) -- pero eleva el costo de falsificar un evento de red de
+  // "cualquier script genérico que adivine la propiedad
+  // __surfaceHoundNetEvent" a "requiere conocer y leer este protocolo
+  // interno específico".
+  const PAGE_TOKEN = (crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`);
+  const TOKEN_ATTR = "data-shx-t";
+  try {
+    document.documentElement.setAttribute(TOKEN_ATTR, PAGE_TOKEN);
+  } catch {
+    // document.documentElement puede no existir todavía en algún borde
+    // exótico (ej. un documento XML sin elemento raíz aún) -- si falla,
+    // el token queda null y content.js simplemente no relayará nada,
+    // fail-closed en vez de fail-open.
+  }
+
   const MAX_BODY_CAPTURE = 20000; // cap general de caracteres por body, evita payloads gigantes
   // Los schemas de introspection GraphQL reales pasan los 20KB con facilidad
   // (decenas o cientos de tipos) -- truncarlos con el límite general corta
@@ -78,7 +103,7 @@
 
   function post(evt) {
     try {
-      window.postMessage({ [FLAG]: true, ...evt, pageUrl: location.href, capturedAt: Date.now() }, "*");
+      window.postMessage({ [FLAG]: true, ...evt, pageUrl: location.href, capturedAt: Date.now(), token: PAGE_TOKEN }, "*");
     } catch {
       // si postMessage falla por algun motivo, no rompemos la app anfitriona
     }

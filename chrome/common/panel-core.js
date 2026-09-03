@@ -708,6 +708,7 @@ function escapeHtml(str) {
 
 function render() {
   try {
+    renderPriorityScore();
     renderMapa();
     renderEndpoints();
     renderParams();
@@ -725,6 +726,57 @@ function render() {
   } catch (err) {
     showPanelError(`Error dibujando el panel: ${err.message}`, err.stack);
   }
+}
+
+// Score de prioridad del dominio actual -- pensado para cuando hay varios
+// targets del mismo programa y hace falta decidir por dónde empezar sin
+// releer las 13 pestañas de cada uno. No reemplaza el juicio del hunter,
+// es una señal rápida junto al título. Pesos: severo=10, IDOR alto=8,
+// secreto=8 (se cuentan aparte de "severo" abajo aunque haya overlap
+// conceptual, porque un secreto amerita el mismo peso que un CORS crítico
+// sin depender de que también haya un endpoint con auth para calificar),
+// cadena sugerida=15 (una correlación confirmada vale más que la suma de
+// sus partes sueltas, por eso pesa más que cualquier hallazgo individual).
+// Score de prioridad del dominio actual -- pensado para cuando hay varios
+// targets del mismo programa y hace falta decidir por dónde empezar sin
+// releer las 13 pestañas de cada uno. No reemplaza el juicio del hunter,
+// es una señal rápida junto al título. Pesos: severo=10, IDOR alto=8,
+// secreto=8, cadena sugerida=5 (deliberadamente bajo, NO 15 como en un
+// diseño anterior -- una cadena se arma a PARTIR de hallazgos que ya se
+// cuentan por separado arriba, así que pesarla igual o más que un
+// hallazgo individual sobre-representaba el mismo secreto/IDOR dos veces;
+// acá funciona como un bonus modesto por tener una correlación
+// confirmada, no como una categoría más a sumar de igual peso).
+//
+// Los hallazgos marcados como falso positivo (dismissedFindings) se
+// excluyen del conteo -- de lo contrario, un dominio donde ya se
+// descartaron todos los CORS/CSP mostraría el mismo score que si esos
+// hallazgos siguieran vigentes.
+function computeDomainPriorityScore(data) {
+  const dismissed = data.dismissedFindings || {};
+  const isActiveSevere = (f) => (f.severity === "critical" || f.severity === "high") && !dismissed[corsFindingKey(f)];
+  let score = 0;
+  score += (data.corsFindings || []).filter(isActiveSevere).length * 10;
+  score += (data.cspFindings || []).filter(isActiveSevere).length * 10;
+  score += (data.securityHeaderFindings || []).filter(isActiveSevere).length * 10;
+  score += (data.oauthFindings || []).filter(isActiveSevere).length * 10;
+  score += (data.idorCandidates || []).filter((c) => c.level === "HIGH").length * 8;
+  score += (data.secrets || []).length * 8;
+  score += computeSuggestedChains(data).length * 5;
+  return score;
+}
+
+function renderPriorityScore() {
+  const el = document.getElementById("domain-priority-score");
+  if (!el) return;
+  const score = computeDomainPriorityScore(currentData);
+  if (score === 0) {
+    el.textContent = "";
+    el.title = "";
+    return;
+  }
+  const level = score >= 30 ? "critical" : score >= 15 ? "high" : "medium";
+  el.innerHTML = `<span class="badge ${level}" title="Score de prioridad: combina hallazgos severos, IDOR de confianza alta, secretos y cadenas sugeridas -- para comparar targets del mismo programa a simple vista, no un veredicto final.">Prioridad: ${score}</span>`;
 }
 
 // ---- Mapa: árbol interactivo de endpoints por path -------------------------
@@ -928,8 +980,8 @@ function renderEntidades() {
 const SENSITIVE_AUTH_PATH_RE = /\/(login|signin|sign-in|log-in|auth|authenticate|otp|verify(-otp)?|verification|2fa|mfa|reset-password|resetpassword|forgot-password|forgotpassword|password-reset|change-password)(\/|\?|$)/i;
 const RATE_LIMIT_HIT_THRESHOLD = 5;
 
-function getRateLimitCandidates() {
-  return Object.values(currentData.endpoints || {}).filter((e) => {
+function getRateLimitCandidates(data) {
+  return Object.values(data.endpoints || {}).filter((e) => {
     if (e.hits < RATE_LIMIT_HIT_THRESHOLD || e.saw429) return false;
     let path = "";
     try { path = new URL(e.url).pathname; } catch { return false; }
@@ -940,7 +992,7 @@ function getRateLimitCandidates() {
 function renderRateLimitFindings() {
   const el = document.getElementById("ratelimit-list");
   if (!el) return;
-  const candidates = getRateLimitCandidates();
+  const candidates = getRateLimitCandidates(currentData);
   if (!candidates.length) return (el.innerHTML = "");
 
   el.innerHTML = `<div class="detail-block">
@@ -962,6 +1014,23 @@ function renderEndpoints() {
   const allEntries = Object.values(currentData.endpoints || {}).sort((a, b) => b.lastSeen - a.lastSeen);
   if (!allEntries.length) return (el.innerHTML = `<div class="empty">Sin endpoints capturados todavía. Navega el sitio.</div>`);
   const entries = allEntries.slice(0, getVisibleCount("endpoints"));
+  // Un endpoint expandido (fila abierta, posiblemente con un resultado de
+  // "Probar CORS ahora" en curso) puede quedar fuera de este corte si
+  // suficiente tráfico NUEVO llega mientras el hunter lo tiene abierto --
+  // con tráfico activo real (ej. UUIDs por request, muy común) esto pasa
+  // en minutos, no horas. Sin este ajuste, la fila desaparece del DOM por
+  // completo en el siguiente refresco automático (cada 3s), llevándose el
+  // resultado que se estaba mostrando -- se ve como si "se cerrara sola".
+  // Se agregan al final, sin duplicar, los expandidos que el corte dejó
+  // afuera; se mantienen visibles hasta que el hunter mismo los cierre.
+  const visibleKeys = new Set(entries.map((e) => e.url + e.method));
+  for (const e of allEntries) {
+    if (visibleKeys.has(e.url + e.method)) continue;
+    if (expanded.endpoints.has(e.url + e.method)) {
+      entries.push(e);
+      visibleKeys.add(e.url + e.method);
+    }
+  }
 
   el.innerHTML = entries
     .map((e) => {
@@ -1815,6 +1884,38 @@ function computeSuggestedChains(data) {
     });
   }
 
+  // ---- 3 reglas nuevas (v0.28.0) -----------------------------------------
+
+  const anySecret = (data.secrets || [])[0];
+  const noAuthApiEndpoint = Object.values(data.endpoints || {}).find((e) => !e.hasAuth && /\/api\//i.test(e.url));
+  if (anySecret && noAuthApiEndpoint) {
+    chains.push({
+      title: "Secreto expuesto + endpoint de API sin autenticación visible en el mismo dominio",
+      severity: "high",
+      description: `Se detectó "${anySecret.name}" expuesto en esta sesión, y por separado hay al menos un endpoint bajo /api/ (${noAuthApiEndpoint.url}) sin header de autenticación observado. No implica que el secreto sirva ahí directamente, pero vale la pena revisar si esa credencial (u otra similar reutilizada) da acceso a rutas que hoy parecen no requerir auth.`,
+    });
+  }
+
+  const introspectionOn = (data.graphqlIntrospection || []).length > 0;
+  const anyMutation = Object.values(data.graphqlOperations || {}).some((op) => op.operationType === "mutation");
+  if (introspectionOn && anyMutation) {
+    chains.push({
+      title: "Introspection de GraphQL habilitada + mutations detectadas",
+      severity: "high",
+      description: "El schema completo es legible vía introspection (pestaña GraphQL), y por separado ya se capturó al menos una mutation real. Con introspection habilitada se puede listar TODAS las mutations disponibles -- incluidas las que la app nunca llegó a invocar en esta sesión de navegación -- lo que amplía mucho la superficie de BFLA a probar más allá de lo que el tráfico capturado mostró por sí solo.",
+    });
+  }
+
+  const rateLimitCandidate = getRateLimitCandidates(data)[0];
+  const weakJwtForBrute = (data.jwts || []).find((j) => j.maxTier === "CANDIDATE");
+  if (rateLimitCandidate && weakJwtForBrute) {
+    chains.push({
+      title: "Posible ausencia de rate limiting en endpoint sensible + JWT con hallazgo de nivel CANDIDATE",
+      severity: "high",
+      description: `"${rateLimitCandidate.url}" acumuló tráfico repetido sin ver nunca un 429, y por separado hay un JWT con hallazgos de nivel CANDIDATE (pestaña JWT). Sin throttling visible, un ataque de fuerza bruta o credential stuffing contra ese endpoint es más viable -- y si el JWT resulta forjable, un token obtenido así podría además manipularse para escalar privilegios en vez de quedar limitado a la cuenta comprometida.`,
+    });
+  }
+
   return chains;
 }
 
@@ -1881,6 +1982,86 @@ function renderChains() {
 function sevBadgeToNoteSeverity(sev) {
   const map = { critical: "Critical", high: "High", medium: "Medium", low: "Low", info: "Informational" };
   return map[sev] || "Medium";
+}
+
+// Intenta interpretar una línea de salida de nuclei (-jsonl) como un match
+// estructurado. nuclei emite exactamente un objeto JSON por línea de match
+// real (sin nada más en el stream, gracias a -silent) -- si la línea no es
+// JSON válido, o no tiene la forma esperada, se trata como salida de texto
+// normal (fallback seguro para cualquier otra herramienta o para una nuclei
+// vieja que no soporte -jsonl).
+function tryParseNucleiMatch(line) {
+  let obj;
+  try {
+    obj = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== "object" || !obj["template-id"] || !obj.info) return null;
+  return {
+    templateId: obj["template-id"],
+    name: obj.info.name || obj["template-id"],
+    severity: (obj.info.severity || "info").toLowerCase(),
+    matchedAt: obj["matched-at"] || obj.host || "",
+    description: obj.info.description || "",
+    extracted: Array.isArray(obj["extracted-results"]) ? obj["extracted-results"] : [],
+    curlCommand: obj["curl-command"] || "",
+  };
+}
+
+// Un match de nuclei se convierte automáticamente en una nota -- mismo
+// patrón que "Crear hallazgo" en IDOR/Cadenas, para que corra nuclei desde
+// el panel y tener el resultado en Notas/Reporte sea un único paso, no dos.
+//
+// domain: el dominio REAL contra el que se corrió el job (job.domain), no
+// necesariamente el que está visible en el panel en este momento -- ver
+// fix de auditoría en runCliJob. Si domain === currentDomain, se escribe
+// en memoria (currentData) y se re-renderiza para que se vea al instante.
+// Si es un dominio distinto (el hunter cambió de pestaña mientras el job
+// seguía corriendo), se lee/escribe DIRECTO en su clave de storage, sin
+// tocar currentData -- que en ese momento pertenece a otro dominio.
+async function autoCreateNoteFromNucleiMatch(match, target, domain) {
+  const note = buildNucleiNote(match, target);
+  if (domain === currentDomain) {
+    currentData.notes = currentData.notes || [];
+    if (currentData.notes.some((n) => n.nucleiDedupeKey === note.nucleiDedupeKey)) return false;
+    currentData.notes.unshift(note);
+    await saveCurrent();
+    render();
+    return true;
+  }
+  try {
+    const key = domainKey(domain);
+    const res = await ext.storage.local.get(key);
+    const data = res[key] || emptyData(domain);
+    data.notes = data.notes || [];
+    if (data.notes.some((n) => n.nucleiDedupeKey === note.nucleiDedupeKey)) return false;
+    data.notes.unshift(note);
+    await ext.storage.local.set({ [key]: data });
+    return true;
+  } catch (e) {
+    console.error("surface-hound: error guardando hallazgo de nuclei en otro dominio", e);
+    return false;
+  }
+}
+
+function buildNucleiNote(match, target) {
+  const dedupeKey = `${match.templateId}::${match.matchedAt}`;
+  const bodyParts = [
+    `Template: ${match.templateId}`,
+    `Target: ${match.matchedAt || target}`,
+  ];
+  if (match.description) bodyParts.push(`Descripción (nuclei): ${match.description}`);
+  if (match.extracted.length) bodyParts.push(`Extraído: ${match.extracted.join(", ")}`);
+  if (match.curlCommand) bodyParts.push(`\nReproducir:\n${match.curlCommand}`);
+  bodyParts.push(`\n(Generado automáticamente desde un job de nuclei -- revisar antes de reportar.)`);
+  return {
+    title: `nuclei: ${match.name}`,
+    severity: sevBadgeToNoteSeverity(match.severity),
+    body: bodyParts.join("\n"),
+    createdAt: Date.now(),
+    nucleiDedupeKey: dedupeKey,
+  };
 }
 
 function renderTech() {
@@ -2076,7 +2257,7 @@ function renderCors() {
     // de rate limiting (se renderiza aparte, en #ratelimit-list, arriba de
     // esta lista) -- dejar esto vacío en vez de mostrar "sin hallazgos",
     // que quedaría contradictorio justo debajo de un hallazgo real.
-    return (el.innerHTML = getRateLimitCandidates().length ? "" : `<div class="empty">Sin hallazgos CORS/CSP aún.</div>`);
+    return (el.innerHTML = getRateLimitCandidates(currentData).length ? "" : `<div class="empty">Sin hallazgos CORS/CSP aún.</div>`);
   }
   const dismissed = currentData.dismissedFindings || {};
   currentData.suppressionRules = currentData.suppressionRules || [];
@@ -2313,6 +2494,13 @@ document.getElementById("refresh").addEventListener("click", async (ev) => {
   }
 });
 
+// Debe coincidir con SEVERE_NOTIFY_PREFIX en background.js -- se duplica
+// acá (en vez de importarlo) porque panel-core.js y background.js corren
+// en contextos de ejecución separados (panel de devtools vs. service
+// worker) sin módulos compartidos entre sí; ambos leen/escriben el mismo
+// storage.local, así que solo hace falta que el STRING coincida.
+const SEVERE_NOTIFY_PREFIX = "shxnotif:";
+
 document.getElementById("clear").addEventListener("click", async () => {
   try {
     if (!currentDomain) return;
@@ -2323,7 +2511,11 @@ document.getElementById("clear").addEventListener("click", async () => {
     // entityGraphKey/snapshotKey) -- saveCurrent() no las toca a
     // propósito, así que hay que borrarlas explícitamente acá o quedarían
     // huérfanas (entityGraph potencialmente varios MB sin limpiar nunca).
-    await ext.storage.local.remove([entityGraphKey(currentDomain), snapshotKey(currentDomain)]);
+    // El contador de notificaciones (shxnotif:) también se borra acá --
+    // sin esto, tras un reset intencional, volver a descubrir el MISMO
+    // hallazgo no dispara una notificación nueva, porque se compara
+    // contra un contador viejo que "Limpiar dominio" no había tocado.
+    await ext.storage.local.remove([entityGraphKey(currentDomain), snapshotKey(currentDomain), SEVERE_NOTIFY_PREFIX + currentDomain]);
     render();
   } catch (err) {
     showPanelError(`Error al limpiar: ${err.message} — si dice "QUOTA_BYTES", el storage está lleno; probá "Limpiar TODOS los dominios".`, err.stack);
@@ -2335,7 +2527,13 @@ document.getElementById("clear-all")?.addEventListener("click", async () => {
     if (!confirm("¿Borrar TODOS los dominios capturados (no solo el actual)? Esto libera espacio de almacenamiento si estaba lleno.")) return;
     const all = await ext.storage.local.get(null);
     const domainKeys = Object.keys(all).filter((k) => k.startsWith(STORAGE_PREFIX) && !k.startsWith(CONFIG_PREFIX));
-    if (domainKeys.length) await ext.storage.local.remove(domainKeys);
+    // shxnotif: NO empieza con "shx:" (el 4to carácter difiere -- "shx:" vs
+    // "shxn...") así que el filtro de arriba no lo alcanza por sí solo; se
+    // busca aparte para no dejar contadores húerfanos que después
+    // suprimirían notificaciones legítimas en un dominio recién reseteado.
+    const notifKeys = Object.keys(all).filter((k) => k.startsWith(SEVERE_NOTIFY_PREFIX));
+    const toRemove = [...domainKeys, ...notifKeys];
+    if (toRemove.length) await ext.storage.local.remove(toRemove);
     currentData = emptyData(currentDomain);
     render();
     showPanelError(`Se borraron ${domainKeys.length} dominio(s). Si el problema era de espacio, ya debería estar resuelto.`);
@@ -2391,6 +2589,33 @@ document.getElementById("import-session-btn")?.addEventListener("click", () => {
   document.getElementById("import-session-file")?.click();
 });
 
+// Lista de URLs en scope, una por línea -- formato que consumen directo
+// `nuclei -l archivo.txt`, `httpx -l archivo.txt`, y sirve como base de
+// targets para ffuf. Esto es lo que cierra el otro sentido de la
+// integración: Surface Hound ALIMENTA a las herramientas externas con lo
+// que ya capturó pasivamente, en vez de que el hunter tenga que copiar
+// URL por URL a mano desde la pestaña Endpoints.
+document.getElementById("export-urls")?.addEventListener("click", async () => {
+  const endpoints = Object.values(currentData.endpoints || {});
+  // Solo en scope: exportar TODO lo capturado (incluido fuera de scope,
+  // que puede incluir CDNs/terceros de terceros) generaría una lista que,
+  // si se corre sin revisar, dispara tráfico activo contra objetivos no
+  // autorizados -- el mismo criterio fail-closed que ya rige "Enviar a CLI".
+  const urls = [...new Set(endpoints.filter((e) => e.inScope === true).map((e) => e.url))].sort();
+  if (!urls.length) {
+    showPanelError("No hay endpoints en scope capturados todavía para exportar.");
+    return;
+  }
+  const blob = new Blob([urls.join("\n") + "\n"], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const filename = `surface-hound-urls-${currentDomain}-${Date.now()}.txt`;
+  if (ext.downloads?.download) {
+    await ext.downloads.download({ url, filename });
+  } else {
+    window.open(url);
+  }
+});
+
 document.getElementById("import-session-file")?.addEventListener("change", async (ev) => {
   const file = ev.target.files?.[0];
   if (!file) return;
@@ -2431,6 +2656,15 @@ document.getElementById("import-session-file")?.addEventListener("change", async
 // entre notas y "##" como encabezado de cada una.
 function escapeMdStructural(text) {
   return String(text ?? "")
+    // Neutraliza HTML embebido (no solo estructura de markdown): los
+    // valores que entran acá (nombres de secretos, nombres de nuclei,
+    // URLs, valores de headers) vienen de datos observados en el TARGET
+    // -- un adversario que sepa que se está corriendo un scanner de bug
+    // bounty podría intentar envenenar el reporte exportado con HTML/JS
+    // embebido, para ejecutarse si el .md se abre en un visor que
+    // renderiza HTML dentro de markdown (varios lo hacen por defecto).
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
     .split("\n")
     .map((line) => {
       if (/^#{1,6}\s/.test(line)) return "\\" + line; // encabezado falso
@@ -2440,19 +2674,57 @@ function escapeMdStructural(text) {
     .join("\n");
 }
 
+// Resumen rápido de superficie -- cuenta lo capturado en cada categoría,
+// para que quien lea el reporte tenga contexto de reconocimiento sin
+// tener que abrir la extensión. Se omite cualquier categoría en 0 para
+// no inflar el reporte con líneas vacías.
+function buildReconSummary(data) {
+  const rows = [
+    ["Endpoints capturados", Object.keys(data.endpoints || {}).length],
+    ["Parámetros distintos", Object.keys(data.params || {}).length],
+    ["Candidatos IDOR", (data.idorCandidates || []).length],
+    ["Secretos detectados", (data.secrets || []).length],
+    ["JWTs vistos", (data.jwts || []).length],
+    ["Hallazgos CORS/CSP/headers", (data.corsFindings || []).length + (data.cspFindings || []).length + (data.securityHeaderFindings || []).length],
+    ["Operaciones GraphQL", Object.keys(data.graphqlOperations || {}).length],
+    ["Tecnologías identificadas", Object.keys(data.techFingerprint || {}).length],
+  ].filter(([, count]) => count > 0);
+  if (!rows.length) return "";
+  return `## Resumen de reconocimiento\n\n${rows.map(([label, count]) => `- ${label}: ${count}`).join("\n")}\n\n---\n\n`;
+}
+
+// Cadenas sugeridas que todavía no se promovieron a una nota manual --
+// van en una sección aparte, claramente marcadas como NO confirmadas
+// (son correlaciones automáticas, no hallazgos validados), para que el
+// reporte final refleje el panorama completo sin mezclarlas con el
+// cuerpo ya redactado a mano de cada nota.
+function buildChainsAppendix(data) {
+  const chains = computeSuggestedChains(data);
+  if (!chains.length) return "";
+  return `## Cadenas de explotación sugeridas (sin confirmar)\n\n_Correlaciones automáticas entre hallazgos independientes -- requieren validación manual antes de reportarse. No reemplazan una prueba activa._\n\n${chains
+    .map((c) => `### ${escapeMdStructural(c.title)}\n\n**Severidad estimada:** ${c.severity}\n\n${escapeMdStructural(c.description)}\n`)
+    .join("\n")}\n---\n\n`;
+}
+
 function buildReport() {
   const notes = currentData.notes || [];
   const footer = `\n---\n\n_Generado con Surface Hound — creado por Zuk4r1._\n`;
   let md = `# Reporte de Bug Bounty — ${currentDomain}\n\n`;
+  md += buildReconSummary(currentData);
   if (!notes.length) {
-    md += "_Sin hallazgos guardados. Agrega notas en la pestaña Notas/Reporte._\n";
-    return md + footer;
+    md += "_Sin hallazgos guardados. Agrega notas en la pestaña Notas/Reporte._\n\n";
+  } else {
+    for (const n of notes) {
+      const platformLine = severityPlatformLine(n.severity);
+      // El título también pasa por el mismo escape que el cuerpo -- una nota
+      // creada automáticamente desde nuclei usa match.name (info.name de la
+      // plantilla) sin ningún filtro previo, así que un título malicioso
+      // llegaría directo a un encabezado ## sin este chequeo.
+      const title = escapeMdStructural((n.title || "").trim()) || "(sin título)";
+      md += `## ${title}\n\n**Severity:** ${n.severity}${platformLine ? `\n\n**Traducción por plataforma:** ${platformLine}` : ""}\n\n**Summary / Steps to reproduce / Impact:**\n\n${escapeMdStructural(n.body)}\n\n---\n\n`;
+    }
   }
-  for (const n of notes) {
-    const platformLine = severityPlatformLine(n.severity);
-    const title = (n.title || "").trim() || "(sin título)";
-    md += `## ${title}\n\n**Severity:** ${n.severity}${platformLine ? `\n\n**Traducción por plataforma:** ${platformLine}` : ""}\n\n**Summary / Steps to reproduce / Impact:**\n\n${escapeMdStructural(n.body)}\n\n---\n\n`;
-  }
+  md += buildChainsAppendix(currentData);
   return md + footer;
 }
 
@@ -2477,7 +2749,7 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
 // para que el hunter vea el comando exacto que va a correr, en vez de solo
 // "nombre_herramienta → url" que no dice nada sobre qué hace la herramienta.
 const CLI_COMMAND_TEMPLATES = {
-  nuclei: (t, h) => `nuclei -u ${t} -silent -timeout 8`,
+  nuclei: (t, h) => `nuclei -u ${t} -silent -jsonl -timeout 8`,
   // El agente genera un archivo temporal único e impredecible por job (no
   // una ruta fija) -- acá no se puede saber el nombre exacto de antemano,
   // así que se muestra el patrón real en vez de una ruta que induciría a
@@ -2566,11 +2838,36 @@ function handleNativeMessage(msg) {
   if (!job) return;
 
   if (msg.status) job.status = msg.status;
-  if (msg.line !== undefined) job.lines.push(msg.line);
+  if (msg.line !== undefined) {
+    // Solo nuclei corre con -jsonl -- para el resto de las herramientas,
+    // tryParseNucleiMatch descarta la línea (no es JSON o no tiene la forma
+    // esperada) y sigue el camino normal de texto plano sin cambios.
+    const match = job.tool === "nuclei" ? tryParseNucleiMatch(msg.line) : null;
+    if (match) {
+      job.findings = job.findings || [];
+      job.findings.push(match);
+      autoCreateNoteFromNucleiMatch(match, job.target, job.domain);
+    } else {
+      job.lines.push(msg.line);
+    }
+  }
   if (msg.done) {
     job.status = msg.blocked ? "blocked" : msg.ok ? "done" : "error";
     if (msg.error) job.lines.push(`[error] ${msg.error}`);
     if (msg.returncode != null) job.lines.push(`[exit code ${msg.returncode}]`);
+    // -jsonl (usado desde v0.28.0 para poder parsear los matches) requiere
+    // una versión de nuclei relativamente reciente -- una instalación
+    // vieja rechaza el flag y el job termina en error sin ninguna pista
+    // de qué pasó. Esto no es un bug del lado de la extensión (no hay
+    // forma de controlar qué versión tiene instalada el hunter), pero al
+    // menos se puede reconocer el patrón de error típico de un flag no
+    // reconocido y dar una pista accionable en vez de un error genérico.
+    if (job.tool === "nuclei" && job.status === "error") {
+      const combined = job.lines.join("\n").toLowerCase();
+      if (combined.includes("jsonl") && (combined.includes("not defined") || combined.includes("unknown flag") || combined.includes("flag provided but not defined"))) {
+        job.lines.push("[hint] Este error suele indicar una versión de nuclei desactualizada -- -jsonl requiere una versión relativamente reciente. Probá `nuclei -version` y actualizá si hace falta.");
+      }
+    }
   }
   renderJobs();
 }
@@ -2588,7 +2885,17 @@ function renderJobs() {
           <span class="mono">${escapeHtml(buildCliCommandDisplay(j.tool, j.target))}</span>
           <span class="job-status ${j.status}">${j.status}</span>
         </div>
-        <div class="job-output">${escapeHtml(j.lines.join("\n")) || "(sin salida todavía)"}</div>
+        ${j.findings?.length ? `<div class="job-findings">${j.findings
+          .map(
+            (f) => `<div class="row">
+              <span class="badge ${escapeHtml(f.severity)}">${escapeHtml(f.severity)}</span>
+              <b>${escapeHtml(f.name)}</b>
+              <div class="hint mono" style="margin-top:4px">${escapeHtml(f.matchedAt)}</div>
+              ${f.extracted.length ? `<div class="hint" style="margin-top:2px">Extraído: ${escapeHtml(f.extracted.join(", "))}</div>` : ""}
+            </div>`
+          )
+          .join("")}</div>` : ""}
+        <div class="job-output">${escapeHtml(j.lines.join("\n")) || (j.findings?.length ? "" : "(sin salida todavía)")}</div>
       </div>`
     )
     .join("");
@@ -2624,8 +2931,14 @@ function runCliJob(tool, target) {
     return;
   }
 
-  // Job optimista con id temporal hasta que el agente confirme el real
-  jobs.set("__pending__", { job_id: null, tool, target, status: "queued", lines: [], open: true });
+  // Job optimista con id temporal hasta que el agente confirme el real.
+  // domain: fix de auditoría (v0.29.0) -- se guarda el dominio contra el
+  // que REALMENTE se corre el job, no el que esté visible cuando llegue
+  // la respuesta. nuclei puede tardar hasta 180s; si el hunter cambia de
+  // pestaña/dominio inspeccionado mientras un job sigue en vuelo, el
+  // resultado debe seguir yendo al dominio original, no al que se esté
+  // mirando en ese momento.
+  jobs.set("__pending__", { job_id: null, tool, target, domain: currentDomain, status: "queued", lines: [], open: true });
   renderJobs();
 
   port.postMessage({ action: "submit_job", tool, target, scope: currentScope || undefined });

@@ -1204,6 +1204,8 @@ function saveDomainData(domain, data) {
       }
       try {
         await ext.storage.local.set(toWrite);
+        await ensureDomainRegistered(domain);
+        await checkAndNotifySevereFindings(domain, rest);
       } catch (e) {
         console.error("surface-hound: error guardando datos de", domain, e);
       }
@@ -1217,6 +1219,157 @@ function saveDomainData(domain, data) {
     evictLRUIfNeeded();
   }, SAVE_DEBOUNCE_MS);
   pendingSaveTimers.set(domain, timer);
+}
+
+// ---- Monitoreo continuo: notificaciones cuando aparece algo de alta
+// severidad, sin que el hunter tenga que estar mirando el panel activamente.
+//
+// El contador de "última cantidad notificada" se persiste en storage (no
+// en una variable en memoria) a propósito: el service worker de una
+// extensión MV3 se reinicia solo, sin aviso, cuando el navegador lo
+// considera inactivo -- cualquier estado en memoria (un Map, una
+// variable) se pierde en ese momento. Si el contador viviera solo en
+// memoria, un reinicio del service worker haría que el próximo hallazgo
+// se comparara contra 0 en vez de contra lo ya notificado, generando una
+// notificación duplicada para algo que el hunter ya vio. Persistiendo el
+// contador, tanto esta función (llamada en tiempo real desde
+// saveDomainData) como el chequeo periódico de abajo leen y escriben el
+// MISMO valor -- ninguno de los dos puede duplicar lo que el otro ya
+// notificó.
+const SEVERE_NOTIFY_PREFIX = "shxnotif:";
+
+function countSevereFindings(data) {
+  const isSevere = (f) => f.severity === "critical" || f.severity === "high";
+  let count = 0;
+  count += (data.corsFindings || []).filter(isSevere).length;
+  count += (data.cspFindings || []).filter(isSevere).length;
+  count += (data.securityHeaderFindings || []).filter(isSevere).length;
+  count += (data.oauthFindings || []).filter(isSevere).length;
+  count += (data.idorCandidates || []).filter((c) => c.level === "HIGH").length;
+  // Cualquier secreto detectado ya pasó el filtro de entropía/placeholders
+  // (ver v0.27.0) -- no hace falta un umbral de severidad adicional acá,
+  // un secreto real siempre amerita una alerta.
+  count += (data.secrets || []).length;
+  return count;
+}
+
+async function checkAndNotifySevereFindings(domain, data) {
+  if (!ext.notifications?.create) return; // entorno sin soporte (tests, Firefox sin el permiso concedido, etc.)
+  const current = countSevereFindings(data);
+  const key = SEVERE_NOTIFY_PREFIX + domain;
+  let previous = 0;
+  try {
+    const res = await ext.storage.local.get(key);
+    previous = res[key] || 0;
+  } catch {
+    return; // si no se puede leer el contador, no arriesgar una notificación duplicada -- mejor omitir esta vez
+  }
+  if (current > previous) {
+    const delta = current - previous;
+    try {
+      ext.notifications.create(`shx-severe-${domain}-${Date.now()}`, {
+        type: "basic",
+        iconUrl: "icons/icon128.png",
+        title: "Surface Hound -- nuevo hallazgo de alta severidad",
+        message: `${domain}: ${delta} hallazgo${delta === 1 ? "" : "s"} nuevo${delta === 1 ? "" : "s"} de severidad alta/crítica.`,
+      });
+    } catch (e) {
+      console.error("surface-hound: error creando notificación", e);
+    }
+  }
+  if (current !== previous) {
+    try {
+      await ext.storage.local.set({ [key]: current });
+    } catch (e) {
+      console.error("surface-hound: error guardando contador de notificación", e);
+    }
+  }
+}
+
+// Chequeo periódico (además del de tiempo real de arriba): re-lee TODOS
+// los dominios guardados y aplica la misma comparación contra su propio
+// contador persistido. Esto no es redundante con el chequeo en tiempo
+// real -- cubre el caso en que el service worker se reinició (perdiendo
+// cualquier timer/debounce en curso) mientras había tráfico pasando, o en
+// que el hunter dejó varias pestañas abiertas navegando sin mirar el
+// panel de ningún dominio en particular.
+const SEVERE_DIGEST_ALARM = "shx-severe-digest";
+
+// ---- Registro liviano de dominios conocidos ---------------------------
+// chrome.storage.local.get() solo admite "todo" (null) o una lista
+// explícita de claves -- no hay forma de pedir "todo excepto las claves
+// que terminan en ::entities". Sin este registro, el único modo de
+// enumerar los dominios guardados era get(null), que trae TAMBIÉN los
+// entity graphs (potencialmente varios MB cada uno) a memoria solo para
+// descartarlos después en el filtro -- una carga innecesaria cada 30
+// minutos, incluso con el navegador inactivo. Con el registro, el digest
+// pide explícitamente solo las claves `shx:<dominio>` que le interesan.
+const KNOWN_DOMAINS_KEY = "shxmeta:domains";
+const knownDomainsCache = new Set(); // evita relecturas repetidas del registro para dominios ya vistos en esta vida del service worker
+
+async function ensureDomainRegistered(domain) {
+  if (knownDomainsCache.has(domain)) return;
+  try {
+    const res = await ext.storage.local.get(KNOWN_DOMAINS_KEY);
+    const list = res[KNOWN_DOMAINS_KEY] || [];
+    if (!list.includes(domain)) {
+      list.push(domain);
+      await ext.storage.local.set({ [KNOWN_DOMAINS_KEY]: list });
+    }
+    knownDomainsCache.add(domain);
+  } catch (e) {
+    console.error("surface-hound: error registrando dominio conocido", e);
+  }
+}
+
+async function runSevereFindingsDigest() {
+  if (!ext.notifications?.create) return;
+  let domains;
+  try {
+    const meta = await ext.storage.local.get(KNOWN_DOMAINS_KEY);
+    domains = meta[KNOWN_DOMAINS_KEY] || [];
+  } catch (e) {
+    console.error("surface-hound: error leyendo el registro de dominios para el digest periódico", e);
+    return;
+  }
+  if (!domains.length) return;
+  const keys = domains.map(domainKey);
+  let all;
+  try {
+    all = await ext.storage.local.get(keys);
+  } catch (e) {
+    console.error("surface-hound: error leyendo storage para el digest periódico", e);
+    return;
+  }
+  // Auto-limpieza del registro: si "Limpiar dominio"/"Limpiar TODOS" borró
+  // los datos de un dominio, su entrada en el registro queda huérfana --
+  // se saca acá mismo (no hace falta que el panel conozca este registro
+  // interno de background.js para mantenerlo sincronizado).
+  const staleDomains = [];
+  for (const domain of domains) {
+    const data = all[domainKey(domain)];
+    if (data) {
+      await checkAndNotifySevereFindings(domain, data);
+    } else {
+      staleDomains.push(domain);
+    }
+  }
+  if (staleDomains.length) {
+    const stillValid = domains.filter((d) => !staleDomains.includes(d));
+    for (const d of staleDomains) knownDomainsCache.delete(d);
+    try {
+      await ext.storage.local.set({ [KNOWN_DOMAINS_KEY]: stillValid });
+    } catch (e) {
+      console.error("surface-hound: error limpiando registro de dominios huérfanos", e);
+    }
+  }
+}
+
+if (ext.alarms) {
+  ext.alarms.create(SEVERE_DIGEST_ALARM, { periodInMinutes: 30 });
+  ext.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === SEVERE_DIGEST_ALARM) runSevereFindingsDigest();
+  });
 }
 
 // Mantiene el cache sincronizado con cambios que NO pasaron por

@@ -31,7 +31,13 @@ import tempfile
 import os
 
 ALLOWED_ACTIONS = {
-    "nuclei":    ["nuclei", "-u", "{target}", "-silent", "-timeout", "8"],
+    # -jsonl: nuclei emite un objeto JSON por línea de match (uno por match
+    # real, sin nada de output "decorativo" de por medio). El agente ya lee
+    # línea por línea y la reenvía tal cual como msg.line -- del lado del
+    # panel se intenta parsear cada línea como JSON de nuclei, y si matchea
+    # el esquema esperado se convierte en un hallazgo estructurado en vez
+    # de quedar como texto suelto en la caja de salida del job.
+    "nuclei":    ["nuclei", "-u", "{target}", "-silent", "-jsonl", "-timeout", "8"],
     "arjun":     ["arjun", "-u", "{target}", "-oT", "{extra_output_file}"],
     "dalfox":    ["dalfox", "url", "{target}", "--silence"],
     "gau":       ["gau", "{target_host}"],

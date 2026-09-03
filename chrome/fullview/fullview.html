@@ -8,6 +8,7 @@
 <body>
   <header>
     <h1 id="domain-title">Superficie de ataque</h1>
+    <span id="domain-priority-score"></span>
     <div class="mode-switch" id="mode-switch">
       <button class="mode-btn" data-mode="passive">Pasivo</button>
       <button class="mode-btn" data-mode="assisted">Asistido</button>
@@ -17,6 +18,7 @@
       <button id="refresh">Refrescar</button>
       <button id="export">Exportar reporte</button>
       <button id="export-session" title="Descarga TODOS los datos crudos del dominio (no solo el reporte) como JSON, para respaldo o para continuar en otra máquina">Exportar sesión</button>
+      <button id="export-urls" title="Descarga un .txt con todas las URLs en scope capturadas, una por línea -- listo para usar como input de nuclei -l, httpx -l, o como base para ffuf">Exportar URLs</button>
       <button id="import-session-btn" title="Fusiona una sesión exportada con lo que ya tenés capturado en este dominio -- no borra nada">Importar sesión</button>
       <input type="file" id="import-session-file" accept="application/json" style="display:none">
       <button id="clear">Limpiar dominio</button>

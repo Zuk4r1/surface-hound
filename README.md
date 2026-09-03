@@ -244,6 +244,7 @@ ejecutarlo desde la extensión. Los jobs corren en cola (varios en
 paralelo), con streaming de salida en vivo y la posibilidad de expandir
 cada uno para ver su resultado completo.
 
+
 ## Instalación
 
 ### 1. Descargar

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Surface Hound",
-  "version": "0.27.0",
+  "version": "0.30.0",
   "description": "Reconocimiento pasivo en vivo y puente a herramientas locales para bug bounty.",
   "permissions": [
     "webRequest",
@@ -9,7 +9,9 @@
     "activeTab",
     "downloads",
     "nativeMessaging",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "alarms",
+    "notifications"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -50,5 +52,5 @@
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
-  "author": "Zuk4r1 (Yordan Su\u00e1rez)"
+  "author": "Zuk4r1 (Yordan Suárez)"
 }
