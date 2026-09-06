@@ -332,7 +332,7 @@ function renderStatusLine() {
     <span>SCOPE: <b style="color:${scopeOn ? "var(--low)" : "var(--muted)"}">${scopeOn ? "ON" : "OFF"}</b>${scopeOn ? ` (${escapeHtml(currentScope.programName || "sin nombre")})` : ""}</span>
     <span class="hint">·</span>
     <span>AGENT: <b style="color:${agentColor}">${agentLabel}</b></span>
-    <span style="margin-left:auto;color:var(--accent);text-shadow:var(--glow)">🕵️‍♂️ Zuk4r1</span>
+    <span style="color:var(--accent);text-shadow:var(--glow)">🕵️‍♂️ Zuk4r1</span>
   `;
 
   // El scope es GLOBAL -- una sola configuración para toda la extensión,
@@ -1752,7 +1752,7 @@ function gqlListSection(title, items, renderItem, emptyText) {
 }
 
 function renderGraphQLSchemaAnalysis(a) {
-  const fieldRow = (f) => `<div class="mono" style="padding:1px 0">${escapeHtml(f.name || "(sin nombre)")}${f.args?.length ? `(${f.args.map((ar) => `${ar.name}: ${ar.type}`).join(", ")})` : "()"}: ${escapeHtml(f.returnType)}${f.looksPrivileged ? ` <span class="badge high">privilegiada?</span>` : ""}</div>`;
+  const fieldRow = (f) => `<div class="mono" style="padding:1px 0">${escapeHtml(f.name || "(sin nombre)")}${f.args?.length ? `(${f.args.map((ar) => `${escapeHtml(ar.name)}: ${escapeHtml(ar.type)}`).join(", ")})` : "()"}: ${escapeHtml(f.returnType)}${f.looksPrivileged ? ` <span class="badge high">privilegiada?</span>` : ""}</div>`;
 
   return `
     <div class="detail cors-card">

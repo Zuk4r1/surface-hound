@@ -13,6 +13,7 @@
   --glow: 0 0 6px rgba(0, 255, 176, 0.45);
 }
 * { box-sizing: border-box; }
+html, body { height: 100%; }
 body {
   margin: 0;
   font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -22,15 +23,34 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
+  overflow: hidden; /* evita doble scrollbar -- el scroll real ocurre adentro de main */
 }
-header, .tabs, main { width: 100%; max-width: min(96vw, 1800px); }
+/* Antes: "max-width: min(96vw, 1800px)" reservaba un margen a los costados
+   a propósito, para no verse demasiado ancho en monitores ultra-anchos --
+   pero el pedido explícito es que la extensión llene el 100% del ancho
+   de la pantalla donde se abra, sin ese margen lateral. Se saca el tope
+   por completo: header/tabs/main/status-line ahora ocupan el 100% del
+   ancho de "body", que ya de por sí ocupa el 100% del viewport (nunca
+   tuvo un ancho propio limitado). */
+header, .tabs, main, #status-line { width: 100%; }
+header, .tabs, #status-line { flex-shrink: 0; } /* mantienen su alto natural aunque el contenido de main cambie */
 header {
   display: flex;
-  justify-content: space-between;
+  /* Antes: "justify-content: space-between" -- en una pantalla ancha (sin
+     el tope de ancho que se sacó en la corrección anterior) esto separaba
+     título, prioridad, modo y botones con huecos enormes entre sí, y como
+     el grupo de botones no entraba en esa distribución, terminaba
+     saltando a una segunda fila completa. Con flex-start + gap, todos los
+     grupos quedan juntos en una sola fila (con espacio moderado entre
+     ellos), y si de verdad no entran todos, envuelven de forma prolija
+     en vez de desparramarse por todo el ancho. */
+  justify-content: flex-start;
   align-items: center;
   padding: 10px 14px;
   background: var(--bg-alt);
   border-bottom: 1px solid var(--border);
+  flex-wrap: wrap; /* si el nombre de dominio es largo y la ventana es angosta, envuelve en vez de desbordar */
+  gap: 16px;
 }
 h1 { font-size: 14px; margin: 0; font-weight: 600; color: var(--accent); text-shadow: var(--glow); }
 button {
@@ -44,10 +64,19 @@ button {
 }
 button:hover:not(:disabled) { border-color: var(--accent); }
 button:disabled { opacity: 0.4; cursor: default; }
-.tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--bg-alt); }
-.tab-btn { border: none; background: transparent; padding: 8px 12px; border-bottom: 2px solid transparent; }
+.tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--bg-alt); flex-wrap: wrap; overflow-x: auto; }
+.tab-btn { border: none; background: transparent; padding: 8px 12px; border-bottom: 2px solid transparent; white-space: nowrap; }
 .tab-btn.active { border-bottom-color: var(--accent); color: var(--accent); text-shadow: var(--glow); }
-main { padding: 12px; overflow-y: auto; height: calc(100vh - 78px); }
+/* Antes: "height: calc(100vh - 78px)" -- un número fijo que asumía que
+   header + status-line + tabs medían exactamente 78px juntos. Se rompía
+   en cuanto algo de arriba cambiaba de alto: un dominio largo que envuelve
+   el header a dos líneas, una advertencia de scope que hace crecer
+   status-line, un cambio de zoom o de fuente del sistema -- en cualquiera
+   de esos casos quedaba un hueco vacío abajo o, peor, contenido cortado
+   sin scroll. Con flexbox (body: columna de 100% de alto; header/tabs/
+   status-line: flex-shrink 0, altura natural; main: flex:1) el espacio de
+   main se recalcula solo, sea cual sea la altura real de lo de arriba. */
+main { padding: 12px; overflow-y: auto; overflow-x: hidden; flex: 1 1 auto; min-height: 0; }
 .tab-content { display: none; }
 .tab-content.active { display: block; }
 
@@ -135,6 +164,7 @@ ul.tree > li { margin: 2px 0; }
   display: flex;
   gap: 8px;
   align-items: center;
+  justify-content: center; /* antes: "Zuk4r1" usaba margin-left:auto para empujarse al extremo derecho -- ahora toda la línea (estado + firma) se centra junta como un solo bloque */
 }
 
 .tree-node:hover { background: rgba(255,255,255,0.03); border-radius: 4px; }

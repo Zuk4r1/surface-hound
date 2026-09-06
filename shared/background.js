@@ -102,7 +102,16 @@ const PARAM_RULES = [
     cwe: "CWE-22",
     patterns: [/^file$/i, /^path$/i, /^page$/i, /^template$/i, /^load$/i, /^include$/i, /^doc$/i, /^folder$/i, /^dir$/i],
     hint: "Prueba ../../../../etc/passwd, encoding doble, null byte y wrappers si aplica.",
-    payloads: ["../../../../etc/passwd", "..%2f..%2f..%2fetc%2fpasswd (encoding)", "....//....//etc/passwd (bypass de filtro simple)", "php://filter/convert.base64-encode/resource=index.php (si es PHP)"]
+    payloads: ["../../../../etc/passwd", "..%2f..%2f..%2fetc%2fpasswd (encoding)", "....//....//etc/passwd (bypass de filtro simple)", "php://filter/convert.base64-encode/resource=index.php (si es PHP)"],
+    // "page" es, con enorme diferencia, el nombre más común de parámetro
+    // de PAGINACIÓN (page=2, page=15) -- sin este filtro, cualquier API
+    // paginada generaba una alerta de LFI en cada request, ahogando el
+    // resto de los hallazgos reales en ruido. Si TODOS los valores
+    // observados para el parámetro son un entero simple, se omite el
+    // hallazgo; basta con que UN SOLO valor observado se vea como ruta
+    // (tenga "/", "\\", "..") para que se muestre igual -- no hace falta
+    // ver ese valor en la primera request, se re-evalúa en cada una.
+    suspiciousValue: (v) => !/^\d{1,6}$/.test(v),
   },
   {
     name: "SQLi",
@@ -164,13 +173,18 @@ function isSafeObjectKey(key) {
   return typeof key === "string" && !DANGEROUS_OBJECT_KEYS.has(key);
 }
 
-function classifyParams(paramNames) {
+function classifyParams(paramEntries) {
   const results = {};
-  for (const p of paramNames) {
+  for (const [p, value] of paramEntries) {
     const hits = [];
     for (const rule of PARAM_RULES) {
       if (rule.patterns.some((re) => re.test(p))) {
-        hits.push({ name: rule.name, cwe: rule.cwe, hint: rule.hint, payloads: rule.payloads || [], needsReflection: !!rule.needsReflection });
+        // Reglas sin suspiciousValue (la mayoría) se comportan exactamente
+        // igual que antes -- "suspicious" siempre true, ningún filtro
+        // adicional. Solo reglas explícitamente marcadas (ver LFI/"page")
+        // exigen que el valor observado se vea realmente sospechoso.
+        const suspicious = rule.suspiciousValue ? rule.suspiciousValue(value) : true;
+        hits.push({ name: rule.name, cwe: rule.cwe, hint: rule.hint, payloads: rule.payloads || [], needsReflection: !!rule.needsReflection, suspicious });
       }
     }
     if (hits.length) results[p] = hits;
@@ -1491,7 +1505,7 @@ function extractDomain(url) {
 
 function extractParamsFromUrl(url) {
   try {
-    return Array.from(new URL(url).searchParams.keys());
+    return Array.from(new URL(url).searchParams.entries());
   } catch {
     return [];
   }
@@ -1679,7 +1693,21 @@ async function upsertEndpoint(domain, url, method) {
     recordOAuthFlow(data, url);
     for (const [param, hits] of Object.entries(classified)) {
       if (!isSafeObjectKey(param)) continue; // ver DANGEROUS_OBJECT_KEYS más arriba
-      if (!data.params[param]) data.params[param] = { hits, sources: [] };
+      const existing = data.params[param];
+      // "suspicious" es sticky: si en CUALQUIER request anterior el valor
+      // observado se vio sospechoso (ver suspiciousValue de LFI), se
+      // mantiene así aunque la request actual traiga un valor inocuo --
+      // no queremos que una alerta real desaparezca solo porque la
+      // siguiente página visitada usó un valor de ejemplo normal.
+      const mergedHits = hits
+        .map((h) => {
+          const prevHit = existing?.hits?.find((ph) => ph.name === h.name);
+          return { ...h, suspicious: h.suspicious || !!prevHit?.suspicious };
+        })
+        .filter((h) => h.suspicious);
+      if (!mergedHits.length) continue; // todo lo visto hasta ahora para este param se ve inocuo (ej. "page" siempre numérico)
+      if (!existing) data.params[param] = { hits: mergedHits, sources: [] };
+      else data.params[param].hits = mergedHits;
       if (!data.params[param].sources.includes(url) && data.params[param].sources.length < 8) {
         data.params[param].sources.push(url);
       }
