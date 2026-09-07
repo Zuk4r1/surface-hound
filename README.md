@@ -25,7 +25,7 @@ términos de atribución y uso.
 
 ---
 
-## Para qué sirve
+## 🎯 Para qué sirve
 
 Mientras navegás normalmente un objetivo dentro de scope, Surface Hound
 construye en segundo plano un mapa completo de su superficie de ataque —
@@ -40,7 +40,7 @@ un paso aparte con otra herramienta. Y cuando encontrás algo que vale la
 pena profundizar, tenés un puente directo a tu toolkit de línea de
 comandos sin salir del navegador.
 
-## El panel, pestaña por pestaña
+## 🧭 El panel, pestaña por pestaña
 
 Todo lo que sigue vive en el mismo panel (F12 → pestaña "Superficie de
 ataque", el popup, o la vista de pantalla completa) — este es el detalle
@@ -225,7 +225,7 @@ Acá armás el reporte final de la sesión:
   adaptar directo a HackerOne/Bugcrowd/Intigriti — con la evidencia, el
   confidence % de cada uno, y la traducción de severidad, no solo el título
 
-## Controles generales (header del panel)
+## ⚙️ Controles generales (header del panel)
 
 - **Modo Pasivo / Asistido / Activo** — qué tan lejos puede llegar la
   extensión sin pedírtelo explícitamente (ver tabla abajo)
@@ -238,7 +238,7 @@ Acá armás el reporte final de la sesión:
   este último borra todo el storage acumulado de todos los dominios, útil
   si `chrome.storage.local` se llena en una sesión larga
 
-### Los tres modos de operación
+### 🔀 Los tres modos de operación
 
 | Modo | Qué desbloquea |
 |---|---|
@@ -246,7 +246,7 @@ Acá armás el reporte final de la sesión:
 | **Asistido** | Habilita chequeos puntuales de un clic (ej. probar CORS en vivo) y arma especificaciones de test para copiar a Burp — sin ejecutar nada por su cuenta. |
 | **Activo** | Habilita el envío de comandos a tus herramientas CLI a través del agente nativo. |
 
-### Puente a tu CLI local
+### 🌉 Puente a tu CLI local
 
 Desde "Análisis avanzado" (dentro de Endpoints), ejecutá nuclei / httpx /
 katana / arjun / dalfox / ffuf / dnsx / gau / subfinder directo contra
@@ -259,7 +259,7 @@ paralelo), con streaming de salida en vivo y la posibilidad de expandir
 cada uno para ver su resultado completo.
 
 
-## Instalación
+## 📦 Instalación
 
 ### 1. Descargar
 
@@ -287,7 +287,7 @@ cargar — no hace falta compilar nada.
 3. Se desinstala al cerrar Firefox (limitación de los complementos
    temporales) — recargala cuando reinicies
 
-### 3. Puente CLI (opcional)
+### 🔌3. Puente CLI (opcional)
 
 Si querés el botón "Ejecutar" para correr herramientas contra un target
 capturado, necesitás tenerlas instaladas en tu PATH y registrar el agente
@@ -302,7 +302,7 @@ Funciona igual en Windows, Linux y macOS — en Windows genera automáticamente
 el `.bat` necesario y se registra en el Registro de Windows, sin pasos
 manuales adicionales. Recargá la extensión después de instalar el agente.
 
-## Uso rápido
+## ⚡Uso rápido
 
 1. Navegá el objetivo normalmente — todo se captura solo
 2. Abrí el panel (F12 → pestaña "Superficie de ataque", o el popup)
@@ -313,7 +313,7 @@ manuales adicionales. Recargá la extensión después de instalar el agente.
 5. Guardá lo que confirmes en **Notas / Reporte** (a mano, o con "Crear
    hallazgo" desde IDOR) y exportalo en Markdown al terminar la sesión
 
-## Para modificar el código
+## 🛠️ Para modificar el código
 
 El código fuente real vive en `shared/` (compartido entre Chrome y
 Firefox) y `manifests/` (un manifest.json por navegador). Las carpetas
@@ -326,7 +326,7 @@ Firefox) y `manifests/` (un manifest.json por navegador). Las carpetas
 Corré esto después de cualquier cambio en `shared/` antes de recargar la
 extensión en el navegador.
 
-## Limitaciones conocidas
+## ⚠️ Limitaciones conocidas
 
 - El scanner de secretos revisa como máximo 40 `<script src>` por página
 - El puente nativo soporta jobs concurrentes limitados (2 por defecto,
@@ -334,7 +334,15 @@ extensión en el navegador.
 - Firefox como complemento temporal no persiste entre reinicios del
   navegador (limitación de la plataforma, no de la extensión).
 
-## Licencia y autoría
+## 📜 Licencia
 
-Ver [LICENSE](./LICENSE). Cualquier redistribución (modificada o no) debe
-mantener la atribución a Zuk4r1.
+Este proyecto está licenciado bajo la **licencia MIT** : consulte [LICENSE](./LICENSE). para obtener más detalles.
+
+## ✍️ Autor
+Creado con ❤️ por [@Zuk4r1](https://github.com/Zuk4r1).
+
+## ☕ Apoya mis proyectos
+Si te resultan útiles mis herramientas, considera dar una ⭐ en GitHub o invitarme un café. ¡Gracias!
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/investigacq)  [![PayPal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://www.paypal.me/yordansuarezrojas)
+
