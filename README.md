@@ -1,4 +1,14 @@
-# 🐺 Surface Hound
+<p align="center">
+  <img src="./native-host/banner.png" alt="Surface Hound" width="900">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/JavaScript-F7DF1E?style=flat&logo=javascript&logoColor=black" alt="JavaScript">
+  <img src="https://img.shields.io/badge/HTML-E34F26?style=flat&logo=html5&logoColor=white" alt="HTML">
+  <img src="https://img.shields.io/badge/CSS-1572B6?style=flat&logo=css3&logoColor=white" alt="CSS">
+  <img src="https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Shell-4EAA25?style=flat&logo=gnubash&logoColor=white" alt="Shell">
+</p>
 
 **Extensión de navegador (Chrome y Firefox) para reconocimiento pasivo en
 vivo durante bug bounty**, con un puente opcional hacia tus herramientas
@@ -35,6 +45,10 @@ comandos sin salir del navegador.
 Todo lo que sigue vive en el mismo panel (F12 → pestaña "Superficie de
 ataque", el popup, o la vista de pantalla completa) — este es el detalle
 de qué hace cada una:
+
+<p align="center">
+  <img src="./native-host/Herramienta.png" alt="Surface Hound" width="900">
+</p>
 
 ### 🗺️ Mapa
 Árbol interactivo de todo lo descubierto, agrupado por segmentos de path
