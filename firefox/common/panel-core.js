@@ -333,7 +333,9 @@ function renderStatusLine() {
     <span class="hint">·</span>
     <span>AGENT: <b style="color:${agentColor}">${agentLabel}</b></span>
     <span style="color:var(--accent);text-shadow:var(--glow)">🕵️‍♂️ Zuk4r1</span>
+    <span id="domain-priority-score"></span>
   `;
+  renderPriorityScore(); // se recrea el span arriba en cada render de esta línea -- hay que repoblarlo al instante
 
   // El scope es GLOBAL -- una sola configuración para toda la extensión,
   // no una por dominio -- y persiste a propósito entre reinicios del
@@ -706,7 +708,40 @@ function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// Cada render*() reconstruye su innerHTML desde cero -- incluido en cada
+// refresco automático (cada 3s, ver setInterval más abajo). Cualquier
+// bloque con scroll (horizontal sobre todo -- muestra de respuesta, JWT
+// completo, evidencia de tecnología, rutas de source maps, headers CORS
+// crudos, specs de prueba) perdía su posición y volvía a 0 en cada
+// refresco: si el hunter estaba arrastrando la barra en ese momento, se
+// veía como si "saltara" y le impidiera seguir. Cualquier elemento
+// marcado con data-scroll-key (una clave estable basada en los datos
+// que representa, no en su posición en el DOM) conserva su scroll a
+// través de un render completo -- se captura antes de reconstruir el
+// HTML y se restaura después, en el elemento nuevo con la misma key.
+function captureScrollPositions(root) {
+  const positions = new Map();
+  root.querySelectorAll("[data-scroll-key]").forEach((node) => {
+    if (node.scrollLeft || node.scrollTop) {
+      positions.set(node.getAttribute("data-scroll-key"), { left: node.scrollLeft, top: node.scrollTop });
+    }
+  });
+  return positions;
+}
+
+function restoreScrollPositions(root, positions) {
+  if (!positions.size) return;
+  root.querySelectorAll("[data-scroll-key]").forEach((node) => {
+    const pos = positions.get(node.getAttribute("data-scroll-key"));
+    if (pos) {
+      node.scrollLeft = pos.left;
+      node.scrollTop = pos.top;
+    }
+  });
+}
+
 function render() {
+  const scrollPositions = captureScrollPositions(document.body);
   try {
     renderPriorityScore();
     renderMapa();
@@ -726,6 +761,7 @@ function render() {
   } catch (err) {
     showPanelError(`Error dibujando el panel: ${err.message}`, err.stack);
   }
+  restoreScrollPositions(document.body, scrollPositions);
 }
 
 // Score de prioridad del dominio actual -- pensado para cuando hay varios
@@ -769,6 +805,7 @@ function computeDomainPriorityScore(data) {
 function renderPriorityScore() {
   const el = document.getElementById("domain-priority-score");
   if (!el) return;
+  if (!currentData) { el.textContent = ""; el.title = ""; return; } // renderStatusLine() puede dispararse antes de que loadData() termine la primera vez
   const score = computeDomainPriorityScore(currentData);
   if (score === 0) {
     el.textContent = "";
@@ -1060,7 +1097,7 @@ function renderEndpoints() {
               </div>
               ${e.sampleResponseBody ? `
                 <div class="response-sample-toggle hint" data-sample-key="${escapeHtml(sampleKey)}" style="cursor:pointer;margin-top:6px">${sampleOpen ? "▼" : "▶"} Ver muestra de la respuesta</div>
-                ${sampleOpen ? `<pre class="mono" style="margin-top:4px;background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;max-height:240px;overflow-y:auto">${escapeHtml(e.sampleResponseBody)}</pre>` : ""}
+                ${sampleOpen ? `<div data-scroll-key="sample-${escapeHtml(e.url + e.method)}" style="margin-top:4px;max-height:240px;overflow-y:auto"><pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;margin:0">${escapeHtml(e.sampleResponseBody)}</pre></div>` : ""}
               ` : ""}
             </div>
             ${relatedParams.length ? `
@@ -1343,7 +1380,7 @@ function renderIdor() {
             <li>Cambiá el ID del recurso por otro observado</li>
             <li>Compará el contexto de autorización (misma sesión vs. otra)</li>
           </ol>
-          <pre class="mono" style="background:var(--bg);padding:8px;border-radius:4px;overflow-x:auto">${escapeHtml(buildTestSpec(c))}</pre>
+          <pre class="mono" data-scroll-key="idor-spec-${escapeHtml(c.template)}" style="background:var(--bg);padding:8px;border-radius:4px;overflow-x:auto">${escapeHtml(buildTestSpec(c))}</pre>
           <div class="detail-actions">
             <button class="btn-copy-burp" data-idx="${i}">Enviar a Burp (copiar)</button>
             <button class="btn-create-finding" data-idx="${i}">Crear hallazgo</button>
@@ -1460,6 +1497,12 @@ function renderJwt() {
         </div>
         ${isOpen ? `
           <div class="detail">
+            <div class="detail-block"><b>Token completo</b><div data-scroll-key="jwt-${escapeHtml(j.token)}" style="max-height:120px;overflow-y:auto"><pre class="mono" style="overflow-x:auto;word-break:break-all;white-space:pre-wrap;margin:0">${escapeHtml(j.token)}</pre></div></div>
+            <div class="detail-block"><b>Encontrado en</b>${
+              j.sources?.length
+                ? `<div style="max-height:100px;overflow-y:auto">${j.sources.map((u) => `<div class="mono" style="word-break:break-all">${escapeHtml(u)}</div>`).join("")}</div>`
+                : `<div class="hint">Sin URL de origen registrada (token capturado antes de que esta versión empezara a guardarla).</div>`
+            }</div>
             <div class="detail-block"><b>Header</b><pre class="mono">${escapeHtml(JSON.stringify(j.header, null, 2))}</pre></div>
             <div class="detail-block"><b>Payload</b><pre class="mono">${escapeHtml(JSON.stringify(j.payload, null, 2))}</pre></div>
           </div>
@@ -1575,11 +1618,11 @@ function renderSourceMaps() {
                   <div class="hint" style="margin-top:4px"><b>sourcesContent (código fuente completo, no solo nombres):</b> ${m.hasSourcesContent ? "presente" : "ausente"}</div>
                   ${m.sampleSourcePaths?.length ? `
                     <div class="hint" style="margin-top:6px"><b>Rutas reveladas (muestra):</b></div>
-                    <pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;max-height:180px;overflow-y:auto">${m.sampleSourcePaths.map(escapeHtml).join("\n")}</pre>
+                    <div data-scroll-key="smap-paths-${escapeHtml(m.scriptUrl)}" style="max-height:180px;overflow-y:auto"><pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;margin:0">${m.sampleSourcePaths.map(escapeHtml).join("\n")}</pre></div>
                   ` : ""}
                   ${m.endpointsFound?.length ? `
                     <div class="hint" style="margin-top:6px"><b>Endpoints encontrados en el código fuente:</b></div>
-                    <pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;max-height:180px;overflow-y:auto">${m.endpointsFound.map(escapeHtml).join("\n")}</pre>
+                    <div data-scroll-key="smap-endpoints-${escapeHtml(m.scriptUrl)}" style="max-height:180px;overflow-y:auto"><pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;margin:0">${m.endpointsFound.map(escapeHtml).join("\n")}</pre></div>
                   ` : ""}
                   ${m.secretsFound?.length ? `
                     <div class="hint" style="margin-top:6px;color:var(--crit)"><b>⚠ Posibles secretos en el código fuente:</b></div>
@@ -2104,7 +2147,7 @@ function renderTech() {
                 ${expandable ? `<span class="hint">${isOpen ? "▲ contraer" : `▼ ${count} evidencias (doble clic)`}</span>` : ""}
               </div>
               ${isOpen
-                ? `<pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;max-height:220px;overflow-y:auto;white-space:pre-wrap;margin-top:4px">${t.evidence.map(escapeHtml).join("\n")}</pre>`
+                ? `<div data-scroll-key="tech-evidence-${escapeHtml(t.name)}" style="margin-top:4px;max-height:220px;overflow-y:auto"><pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;white-space:pre-wrap;margin:0">${t.evidence.map(escapeHtml).join("\n")}</pre></div>`
                 : `<div class="hint" style="margin-top:2px">${t.evidence.slice(0, 2).map(escapeHtml).join(" · ")}${count > 2 ? ` · +${count - 2} más` : ""}</div>`
               }
             </div>`;
@@ -2189,7 +2232,7 @@ function renderGraphQL() {
         <div class="hint">visto ${op.hits}x · último: ${new Date(op.lastSeen).toLocaleTimeString()}</div>
         ${isMutation && isOpen ? `
           <div class="detail">
-            <pre class="mono" style="background:var(--bg);padding:8px;border-radius:4px;overflow-x:auto">${escapeHtml(buildBflaSpec(op))}</pre>
+            <pre class="mono" data-scroll-key="gql-spec-${escapeHtml(key)}" style="background:var(--bg);padding:8px;border-radius:4px;overflow-x:auto">${escapeHtml(buildBflaSpec(op))}</pre>
             <div class="detail-actions">
               <button class="btn-gql-copy" data-gql-key="${escapeHtml(key)}">Copiar</button>
             </div>
@@ -2319,7 +2362,7 @@ function renderCors() {
             <div class="cors-card-section">
               <div class="hint"><b>Evidencia</b></div>
               <div class="hint" style="margin-top:4px">Header:</div>
-              <pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;margin:2px 0">${escapeHtml(f.rawHeader || "(sin header capturado)")}</pre>
+              <pre class="mono" data-scroll-key="cors-raw-${escapeHtml(corsFindingKey(f))}" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;margin:2px 0">${escapeHtml(f.rawHeader || "(sin header capturado)")}</pre>
               <div class="hint">Origen de la observación: HTTP response header</div>
             </div>
             <div class="cors-card-divider"></div>

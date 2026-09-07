@@ -1799,8 +1799,24 @@ ext.webRequest.onSendHeaders.addListener(
         data.endpoints[epKey].hasAuth = true;
       }
       if (jwts.length) {
-        const existing = new Set(data.jwts.map((j) => j.token));
-        for (const j of jwts) if (!existing.has(j.token)) data.jwts.push(j);
+        // Antes: un token ya visto se descartaba entero (dedup por
+        // token), perdiendo cualquier URL nueva donde volviera a
+        // aparecer. Ahora se acumulan las URLs de origen (hasta 5) tanto
+        // para tokens nuevos como para uno ya conocido.
+        const byToken = new Map(data.jwts.map((j) => [j.token, j]));
+        for (const j of jwts) {
+          const existingJwt = byToken.get(j.token);
+          if (existingJwt) {
+            existingJwt.sources = existingJwt.sources || [];
+            if (!existingJwt.sources.includes(details.url) && existingJwt.sources.length < 5) {
+              existingJwt.sources.push(details.url);
+            }
+          } else {
+            j.sources = [details.url];
+            data.jwts.push(j);
+            byToken.set(j.token, j);
+          }
+        }
       }
       await saveDomainData(domain, data);
     });
@@ -1892,11 +1908,22 @@ ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         for (const s of msg.secrets) if (!existing.has(s.match + s.source)) data.secrets.push(s);
       }
       if (msg.jwtTokens?.length) {
-        const existing = new Set(data.jwts.map((j) => j.token));
+        const byToken = new Map(data.jwts.map((j) => [j.token, j]));
         for (const token of msg.jwtTokens) {
-          if (existing.has(token)) continue;
+          const existingJwt = byToken.get(token);
+          if (existingJwt) {
+            existingJwt.sources = existingJwt.sources || [];
+            if (msg.pageUrl && !existingJwt.sources.includes(msg.pageUrl) && existingJwt.sources.length < 5) {
+              existingJwt.sources.push(msg.pageUrl);
+            }
+            continue;
+          }
           const decoded = decodeJwt(token);
-          if (decoded) data.jwts.push(decoded);
+          if (decoded) {
+            decoded.sources = msg.pageUrl ? [msg.pageUrl] : [];
+            data.jwts.push(decoded);
+            byToken.set(token, decoded);
+          }
         }
       }
       recordTechFindings(data, msg.techSignals);
