@@ -47,7 +47,7 @@ ataque", el popup, o la vista de pantalla completa) — este es el detalle
 de qué hace cada una:
 
 <p align="center">
-  <img src="./native-host/Herramienta.png" alt="Surface Hound" width="900">
+  <img src="./native-host/Herramienta.png" alt="Surface Hound" width="250%">
 </p>
 
 ### 🗺️ Mapa
