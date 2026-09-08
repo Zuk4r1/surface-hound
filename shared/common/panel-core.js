@@ -623,7 +623,7 @@ function clearPanelError() {
 }
 
 function emptyData(domain) {
-  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], securityHeaderFindings: [], oauthFlows: {}, oauthFindings: [], idorCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, entitySeenInResponse: {}, reflectedValues: {}, dismissedFindings: {}, graphqlOperations: {}, graphqlIntrospection: [], techFingerprint: {}, sourceMaps: {} };
+  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], securityHeaderFindings: [], oauthFlows: {}, oauthFindings: [], idorCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, entitySeenInResponse: {}, reflectedValues: {}, dismissedFindings: {}, secretStatus: {}, graphqlOperations: {}, graphqlIntrospection: [], techFingerprint: {}, sourceMaps: {} };
 }
 
 // ---- Severidad multi-plataforma: traducción de nuestra escala interna
@@ -797,7 +797,7 @@ function computeDomainPriorityScore(data) {
   score += (data.securityHeaderFindings || []).filter(isActiveSevere).length * 10;
   score += (data.oauthFindings || []).filter(isActiveSevere).length * 10;
   score += (data.idorCandidates || []).filter((c) => c.level === "HIGH").length * 8;
-  score += (data.secrets || []).length * 8;
+  score += (data.secrets || []).filter((s) => !dismissed[s.match + s.source]).length * 8;
   score += computeSuggestedChains(data).length * 5;
   return score;
 }
@@ -1687,28 +1687,155 @@ function renderSourceMaps() {
   });
 }
 
+// Los 4 estados de verificación son marcados a MANO por el hunter, nunca
+// calculados por la extensión -- Surface Hound no prueba credenciales
+// contra APIs reales (eso requiere consentimiento explícito, como ya
+// pasa con "Probar CORS ahora"). El estado por defecto de todo secreto
+// nuevo es "unverified".
+const SECRET_STATUS_ORDER = ["unverified", "valid_format", "potentially_valid", "revoked_invalid"];
+const SECRET_STATUS_INFO = {
+  unverified: { emoji: "⚪", label: "No verificada" },
+  valid_format: { emoji: "🟢", label: "Formato válido" },
+  potentially_valid: { emoji: "🟡", label: "Potencialmente válida" },
+  revoked_invalid: { emoji: "🔴", label: "Revocada / inválida" },
+};
+
 function renderSecrets() {
   const el = document.getElementById("secrets-list");
   const entries = [...(currentData.secrets || [])].sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
   if (!entries.length) return (el.innerHTML = `<div class="empty">Sin secretos detectados aún.</div>`);
+  const dismissed = currentData.dismissedFindings || {};
+  const secretStatus = currentData.secretStatus || {};
+  expanded.secrets = expanded.secrets || new Set();
+
   el.innerHTML = entries
-    .map((s) => {
+    .map((s, i) => {
+      const key = s.match + s.source;
+      const isOpen = expanded.secrets.has(key);
+      const isDismissed = !!dismissed[key];
       const exposure = s.source && /\.js(\?|$)/.test(s.source) ? "JavaScript público" : "Código de la página";
-      return `<div class="row">
-      <div class="row-head" style="display:flex;justify-content:space-between;align-items:center">
-        <span class="title">${escapeHtml(s.name)}</span>
-        ${s.byDesignPublic ? `<span class="badge low">público por diseño</span>` : sevBadge(s.severity)}
+      const status = secretStatus[key] || "unverified";
+      const info = SECRET_STATUS_INFO[status];
+      const preview = s.match.length > 60 ? s.match.slice(0, 60) + "..." : s.match;
+
+      return `<div class="row ${isDismissed ? "out-of-scope" : ""}">
+      <div class="row-head" data-kind="secrets" data-key="${escapeHtml(key)}" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px">
+        <span>
+          <span class="title">Tipo: ${escapeHtml(s.name)}</span>
+          ${s.byDesignPublic ? `<span class="badge low">público por diseño</span>` : sevBadge(s.severity)}
+          <span class="hint">${info.emoji} ${info.label}</span>
+          ${isDismissed ? `<span class="hint">(descartado como falso positivo)</span>` : ""}
+        </span>
+        <span class="hint">${isOpen ? "▲" : "▼ doble clic para ver el detalle completo"}</span>
       </div>
-      <div class="hint" style="margin-top:4px">
-        <b>Confianza:</b> ${s.confidence != null ? s.confidence + "%" : "?"} ·
-        <b>Exposición:</b> ${escapeHtml(exposure)}
-      </div>
-      <div class="mono hint" style="margin-top:4px">${escapeHtml(s.match)}</div>
-      <div class="hint">Ubicación: ${escapeHtml(s.source)}</div>
-      ${s.note ? `<div class="hint" style="margin-top:4px;font-style:italic">${escapeHtml(s.note)}</div>` : ""}
+      <div class="mono hint" style="margin-top:4px;word-break:break-all">${escapeHtml(preview)}</div>
+      ${isOpen ? `
+        <div class="detail">
+          <div class="detail-block"><b>Confianza</b>: ${s.confidence != null ? s.confidence + "%" : "?"}</div>
+          ${s.reason ? `<div class="detail-block"><b>Razón</b><div class="hint">${escapeHtml(s.reason)}</div></div>` : ""}
+          <div class="detail-block">
+            <b>Valor completo</b>
+            <div data-scroll-key="secret-${escapeHtml(key)}" style="max-height:100px;overflow-y:auto;margin-top:2px">
+              <pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;word-break:break-all;white-space:pre-wrap;margin:0">${escapeHtml(s.match)}</pre>
+            </div>
+            <button class="btn-copy-secret" data-idx="${i}" style="margin-top:4px">Copiar valor</button>
+          </div>
+          ${s.context ? `<div class="detail-block"><b>Contexto</b><pre class="mono" style="background:var(--bg);padding:6px;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;margin-top:2px">${escapeHtml(s.context)}</pre></div>` : ""}
+          <div class="detail-block"><b>Entropía</b>: ${s.entropy != null ? s.entropy + " / 8" : "?"}</div>
+          <div class="detail-block"><b>Exposición</b>: ${escapeHtml(exposure)}</div>
+          <div class="detail-block"><b>Ubicación</b><div class="mono hint" style="word-break:break-all">${escapeHtml(s.source)}</div></div>
+          ${s.note ? `<div class="detail-block hint" style="font-style:italic">${escapeHtml(s.note)}</div>` : ""}
+          ${s.nextStep ? `<div class="detail-block"><b>Próximo paso sugerido</b><div class="hint">${escapeHtml(s.nextStep)}</div></div>` : ""}
+          <div class="detail-block">
+            <b>Estado</b>
+            <div style="display:flex;gap:6px;margin-top:4px;flex-wrap:wrap">
+              ${SECRET_STATUS_ORDER.map((st) => `<button class="btn-secret-status ${status === st ? "active-toggle" : ""}" data-idx="${i}" data-status="${st}">${SECRET_STATUS_INFO[st].emoji} ${SECRET_STATUS_INFO[st].label}</button>`).join("")}
+            </div>
+          </div>
+          <div class="detail-actions">
+            <button class="btn-create-finding-secret" data-idx="${i}">Crear hallazgo</button>
+            <button class="btn-secret-dismiss" data-idx="${i}">${isDismissed ? "Restaurar (no es falso positivo)" : "Marcar como falso positivo"}</button>
+          </div>
+        </div>
+      ` : ""}
     </div>`;
     })
     .join("");
+
+  el.querySelectorAll(".row-head[data-kind='secrets']").forEach((head) => {
+    head.addEventListener("dblclick", (ev) => {
+      ev.stopPropagation();
+      const key = head.dataset.key;
+      expanded.secrets.has(key) ? expanded.secrets.delete(key) : expanded.secrets.add(key);
+      renderSecrets();
+    });
+  });
+
+  el.querySelectorAll(".btn-copy-secret").forEach((btn) => {
+    btn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const s = entries[Number(btn.dataset.idx)];
+      try {
+        await navigator.clipboard.writeText(s.match);
+        btn.textContent = "Copiado ✓";
+        setTimeout(() => (btn.textContent = "Copiar valor"), 1200);
+      } catch {
+        // portapapeles puede fallar sin foco en la página; no rompe el resto
+      }
+    });
+  });
+
+  el.querySelectorAll(".btn-secret-status").forEach((btn) => {
+    btn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const s = entries[Number(btn.dataset.idx)];
+      const key = s.match + s.source;
+      currentData.secretStatus = currentData.secretStatus || {};
+      currentData.secretStatus[key] = btn.dataset.status;
+      await saveCurrent();
+      renderSecrets();
+    });
+  });
+
+  el.querySelectorAll(".btn-secret-dismiss").forEach((btn) => {
+    btn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const s = entries[Number(btn.dataset.idx)];
+      const key = s.match + s.source;
+      currentData.dismissedFindings = currentData.dismissedFindings || {};
+      if (currentData.dismissedFindings[key]) delete currentData.dismissedFindings[key];
+      else currentData.dismissedFindings[key] = true;
+      await saveCurrent();
+      renderSecrets();
+    });
+  });
+
+  el.querySelectorAll(".btn-create-finding-secret").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const s = entries[Number(btn.dataset.idx)];
+      currentData.notes = currentData.notes || [];
+      currentData.notes.unshift({
+        title: `Secreto expuesto: ${s.name}`,
+        severity: sevBadgeToNoteSeverity(s.severity),
+        body: [
+          `Tipo: ${s.name}`,
+          `Confianza: ${s.confidence}%`,
+          `Valor: ${s.match}`,
+          `Ubicación: ${s.source}`,
+          s.context ? `Contexto: ${s.context}` : "",
+          "",
+          `(Confianza ${s.confidence}% -- pendiente de validación manual antes de reportar.)`,
+        ].filter(Boolean).join("\n"),
+        createdAt: Date.now(),
+      });
+      saveCurrent();
+      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+      document.querySelectorAll(".tab-content").forEach((c) => c.classList.remove("active"));
+      document.querySelector(".tab-btn[data-tab='notes']").classList.add("active");
+      document.getElementById("tab-notes").classList.add("active");
+      render();
+    });
+  });
 }
 
 const SEVERITY_IMPACT = { critical: "ALTO", high: "ALTO", medium: "MODERADO", low: "BAJO", info: "BAJO" };

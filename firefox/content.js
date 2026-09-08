@@ -61,18 +61,40 @@
   }
 
   const SECRET_PATTERNS = [
-    { name: "AWS Access Key ID", re: /AKIA[0-9A-Z]{16}/g, confidence: 96, severity: "critical" },
-    { name: "AWS Secret Key (heurístico)", re: /(?:aws_secret|secret_key)["'\s:=]+[A-Za-z0-9\/+=]{40}/gi, confidence: 60, severity: "high", note: "Patrón heurístico: confirmar que el valor es realmente una clave y no un hash/placeholder." },
-    { name: "GitHub Token", re: /gh[pousr]_[A-Za-z0-9]{36,}/g, confidence: 95, severity: "critical" },
-    { name: "Slack Token", re: /xox[baprs]-[0-9A-Za-z-]{10,48}/g, confidence: 90, severity: "high" },
-    { name: "Stripe Secret Key", re: /sk_live_[0-9a-zA-Z]{24,}/g, confidence: 96, severity: "critical" },
-    { name: "Stripe Test Secret Key", re: /sk_test_[0-9a-zA-Z]{24,}/g, confidence: 92, severity: "low", note: "Clave de entorno de pruebas — impacto limitado, pero repórtala igual si aparece en producción." },
-    { name: "Stripe Publishable Key", re: /pk_(live|test)_[0-9a-zA-Z]{24,}/g, confidence: 90, severity: "info", byDesignPublic: true, note: "Diseñada para exponerse en el cliente (Stripe.js la necesita ahí). No es un secreto por sí sola." },
-    { name: "Google API Key", re: /AIza[0-9A-Za-z\-_]{35}/g, confidence: 80, severity: "info", byDesignPublic: true, note: "Las API keys de Google (Maps/Firebase) suelen estar pensadas para el cliente y restringirse por referrer, no por secreto. Confirma las restricciones antes de reportar." },
-    { name: "Firebase Config", re: /"apiKey"\s*:\s*"AIza[0-9A-Za-z\-_]{35}"/g, confidence: 75, severity: "info", byDesignPublic: true, note: "La config de Firebase Web es pública por diseño; la protección real son las Security Rules del proyecto." },
-    { name: "Sentry DSN", re: /https:\/\/[a-f0-9]{32}@[a-z0-9.\-]+\.ingest\.sentry\.io\/\d+/gi, confidence: 90, severity: "info", byDesignPublic: true, note: "El DSN de Sentry está diseñado para usarse desde el cliente." },
-    { name: "Private Key block", re: /-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----/g, confidence: 99, severity: "critical" },
-    { name: "Credencial genérica (patrón api_key/secret/token)", re: /(?:api[_-]?key|apikey|secret|token)["'\s:=]+["'][A-Za-z0-9_\-]{20,}["']/gi, confidence: 50, severity: "medium", note: "Patrón genérico con alta tasa de falsos positivos — se descartan automáticamente los valores de baja entropía (placeholders tipo 'xxxxxxxx')." },
+    { name: "AWS Access Key ID", re: /AKIA[0-9A-Z]{16}/g, confidence: 96, severity: "critical",
+      reason: "Prefijo AKIA + exactamente 16 caracteres alfanuméricos (formato fijo de AWS, no heurístico).",
+      nextStep: "Probar con `aws sts get-caller-identity` usando esta clave -- hazlo desde tu propia terminal, fuera de la extensión, y solo si el programa lo permite." },
+    { name: "AWS Secret Key (heurístico)", re: /(?:aws_secret|secret_key)["'\s:=]+[A-Za-z0-9\/+=]{40}/gi, confidence: 60, severity: "high", note: "Patrón heurístico: confirmar que el valor es realmente una clave y no un hash/placeholder.",
+      reason: "Nombre de variable (aws_secret/secret_key) + valor de 40 caracteres compatible con base64 -- no confirma que sea una clave real.",
+      nextStep: "Combinala con un AWS Access Key ID visto cerca (mismo request/respuesta) y probá `aws sts get-caller-identity` fuera de la extensión." },
+    { name: "GitHub Token", re: /gh[pousr]_[A-Za-z0-9]{36,}/g, confidence: 95, severity: "critical",
+      reason: "Prefijo reconocido de GitHub (ghp_/gho_/ghu_/ghs_/ghr_) + longitud mínima de 36 caracteres tras el prefijo.",
+      nextStep: "Probar con `curl -H \"Authorization: token <valor>\" https://api.github.com/user` desde tu propia terminal." },
+    { name: "Slack Token", re: /xox[baprs]-[0-9A-Za-z-]{10,48}/g, confidence: 90, severity: "high",
+      reason: "Prefijo reconocido de Slack (xoxb-/xoxp-/xoxa-/xoxr-/xoxs-).",
+      nextStep: "Probar con `curl -H \"Authorization: Bearer <valor>\" https://slack.com/api/auth.test` desde tu propia terminal." },
+    { name: "Stripe Secret Key", re: /sk_live_[0-9a-zA-Z]{24,}/g, confidence: 96, severity: "critical",
+      reason: "Prefijo sk_live_ -- clave de producción de Stripe.",
+      nextStep: "No la ejecutes contra la API de Stripe sin autorización explícita del programa -- documentá el hallazgo y repórtalo tal cual." },
+    { name: "Stripe Test Secret Key", re: /sk_test_[0-9a-zA-Z]{24,}/g, confidence: 92, severity: "low", note: "Clave de entorno de pruebas — impacto limitado, pero repórtala igual si aparece en producción.",
+      reason: "Prefijo sk_test_ -- clave de entorno de pruebas de Stripe, no de producción.",
+      nextStep: "Confirmá si aparece en un contexto de PRODUCCIÓN (no solo staging/dev) antes de reportar -- ahí está el impacto real." },
+    { name: "Stripe Publishable Key", re: /pk_(live|test)_[0-9a-zA-Z]{24,}/g, confidence: 90, severity: "info", byDesignPublic: true, note: "Diseñada para exponerse en el cliente (Stripe.js la necesita ahí). No es un secreto por sí sola.",
+      reason: "Prefijo pk_ -- clave publicable, pensada para vivir en el cliente." },
+    { name: "Google API Key", re: /AIza[0-9A-Za-z\-_]{35}/g, confidence: 80, severity: "info", byDesignPublic: true, note: "Las API keys de Google (Maps/Firebase) suelen estar pensadas para el cliente y restringirse por referrer, no por secreto. Confirma las restricciones antes de reportar.",
+      reason: "Prefijo AIza + 35 caracteres (formato fijo de Google API Key).",
+      nextStep: "Verificá las restricciones de la key (referrer/IP/API habilitadas) en vez de asumir que la sola exposición es el hallazgo." },
+    { name: "Firebase Config", re: /"apiKey"\s*:\s*"AIza[0-9A-Za-z\-_]{35}"/g, confidence: 75, severity: "info", byDesignPublic: true, note: "La config de Firebase Web es pública por diseño; la protección real son las Security Rules del proyecto.",
+      reason: "Bloque JSON con el campo \"apiKey\" y una clave con formato de Google/Firebase.",
+      nextStep: "Si el objetivo es Firebase, el hallazgo real está en las Security Rules (Firestore/Storage) mal configuradas, no en esta key." },
+    { name: "Sentry DSN", re: /https:\/\/[a-f0-9]{32}@[a-z0-9.\-]+\.ingest\.sentry\.io\/\d+/gi, confidence: 90, severity: "info", byDesignPublic: true, note: "El DSN de Sentry está diseñado para usarse desde el cliente.",
+      reason: "URL con el formato exacto de un DSN de Sentry (host ingest.sentry.io + ID numérico de proyecto)." },
+    { name: "Private Key block", re: /-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----/g, confidence: 99, severity: "critical",
+      reason: "Encabezado PEM reconocido -- prácticamente nunca es un falso positivo; lo que sigue al encabezado es la clave real.",
+      nextStep: "Si podés capturar el bloque completo (no solo el encabezado), validá el formato con `openssl rsa -in archivo -check` fuera de la extensión." },
+    { name: "Credencial genérica (patrón api_key/secret/token)", re: /(?:api[_-]?key|apikey|secret|token)["'\s:=]+["'][A-Za-z0-9_\-]{20,}["']/gi, confidence: 50, severity: "medium", note: "Patrón genérico con alta tasa de falsos positivos — se recomienda prueba manual para confirmar el hallazgo.",
+      reason: "Coincidencia basada únicamente en nombre de variable (api_key/secret/token) + entropía del valor -- no hay un formato fijo que confirme que es real.",
+      nextStep: "Revisá el contexto (¿es un ejemplo en un comentario? ¿un placeholder de documentación?) antes de asumir que es un secreto real." },
   ];
   const JWT_RE = /eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]*/g;
 
@@ -165,19 +187,38 @@
         // El patrón genérico es el único con alto riesgo de placeholders/valores
         // de relleno (ej. "xxxxxxxxxxxxxxxx" o "YOUR_API_KEY_HERE"); se filtra
         // por entropía Y por marcador textual conocido.
+        const valueMatch = m.match(/["']([A-Za-z0-9_\-]{20,})["']$/);
+        const value = valueMatch ? valueMatch[1] : m;
+        const entropy = shannonEntropy(value);
         if (p.confidence <= 55) {
-          const valueMatch = m.match(/["']([A-Za-z0-9_\-]{20,})["']$/);
-          const value = valueMatch ? valueMatch[1] : m;
-          if (shannonEntropy(value) < 3.0) continue;
+          if (entropy < 3.0) continue;
           if (PLACEHOLDER_MARKER_RE.test(value)) continue;
         }
+        // Contexto: unos caracteres antes/después del match en el texto
+        // original -- suele ser la señal más rápida para descartar un
+        // falso positivo a ojo (ej. ver que está dentro de un comentario
+        // de ejemplo, no en código real). indexOf() sobre la primera
+        // aparición alcanza -- ya se dedupea por Set arriba, así que un
+        // mismo match no se procesa dos veces igual.
+        const idx = text.indexOf(m);
+        const CONTEXT_RADIUS = 35;
+        const context = idx === -1 ? null : text.slice(Math.max(0, idx - CONTEXT_RADIUS), idx + m.length + CONTEXT_RADIUS);
         secrets.push({
           name: p.name,
           severity: p.severity,
           confidence: p.confidence,
           byDesignPublic: !!p.byDesignPublic,
           note: p.note || null,
-          match: m.slice(0, 80),
+          reason: p.reason || null,
+          nextStep: p.nextStep || null,
+          entropy: Math.round(entropy * 100) / 100,
+          context,
+          // Antes: "match: m.slice(0, 80)" -- truncaba el valor guardado
+          // en storage, no solo la vista colapsada. 500 caracteres cubre
+          // cómodamente cualquier secreto real (los tokens más largos
+          // observados en la práctica no se acercan a eso) sin arriesgar
+          // un bloque PEM completo de varios KB inflando el storage.
+          match: m.slice(0, 500),
           source
         });
       }

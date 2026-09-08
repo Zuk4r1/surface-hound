@@ -1170,6 +1170,7 @@ async function getDomainData(domain) {
     entitySeenInResponse: {},
     reflectedValues: {},
     dismissedFindings: {},
+    secretStatus: {},
     graphqlOperations: {},
     graphqlIntrospection: [],
     techFingerprint: {},
@@ -1252,8 +1253,17 @@ function saveDomainData(domain, data) {
 // notificó.
 const SEVERE_NOTIFY_PREFIX = "shxnotif:";
 
+// Debe coincidir con corsFindingKey en panel-core.js -- se duplica acá
+// (en vez de importarla) porque background.js y panel-core.js corren en
+// contextos de ejecución separados (service worker vs. panel de
+// devtools) sin módulos compartidos entre sí.
+function corsFindingKey(f) {
+  return `${f.type}:${f.directive}:${f.url}:${f.msg}`;
+}
+
 function countSevereFindings(data) {
-  const isSevere = (f) => f.severity === "critical" || f.severity === "high";
+  const dismissed = data.dismissedFindings || {};
+  const isSevere = (f) => (f.severity === "critical" || f.severity === "high") && !dismissed[corsFindingKey(f)];
   let count = 0;
   count += (data.corsFindings || []).filter(isSevere).length;
   count += (data.cspFindings || []).filter(isSevere).length;
@@ -1262,8 +1272,10 @@ function countSevereFindings(data) {
   count += (data.idorCandidates || []).filter((c) => c.level === "HIGH").length;
   // Cualquier secreto detectado ya pasó el filtro de entropía/placeholders
   // (ver v0.27.0) -- no hace falta un umbral de severidad adicional acá,
-  // un secreto real siempre amerita una alerta.
-  count += (data.secrets || []).length;
+  // un secreto real siempre amerita una alerta. Uno marcado como falso
+  // positivo por el hunter (ver Estado en la pestaña Secretos) se excluye,
+  // igual que ya pasa con CORS/CSP/headers/OAuth arriba.
+  count += (data.secrets || []).filter((s) => !dismissed[s.match + s.source]).length;
   return count;
 }
 
