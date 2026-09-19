@@ -1702,11 +1702,29 @@ const SECRET_STATUS_INFO = {
 
 function renderSecrets() {
   const el = document.getElementById("secrets-list");
-  const entries = [...(currentData.secrets || [])].sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
-  if (!entries.length) return (el.innerHTML = `<div class="empty">Sin secretos detectados aún.</div>`);
+  const allEntries = [...(currentData.secrets || [])].sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+  if (!allEntries.length) return (el.innerHTML = `<div class="empty">Sin secretos detectados aún.</div>`);
   const dismissed = currentData.dismissedFindings || {};
   const secretStatus = currentData.secretStatus || {};
   expanded.secrets = expanded.secrets || new Set();
+
+  // Sin tope, un bundle JS minificado con muchos identificadores hash-like
+  // puede activar cientos o miles de coincidencias del patrón genérico en
+  // una sola página -- medido: 3000 secretos simulados tardaban 3000ms en
+  // renderizar, congelando el panel (misma clase de problema ya corregido
+  // antes en Endpoints/Entidades). Mismo criterio que ahí: se pagina, y
+  // cualquier secreto que el hunter tenga expandido se mantiene visible
+  // aunque el corte lo deje afuera, hasta que lo cierre él mismo.
+  const entries = allEntries.slice(0, getVisibleCount("secrets"));
+  const visibleKeys = new Set(entries.map((s) => s.match + s.source));
+  for (const s of allEntries) {
+    const k = s.match + s.source;
+    if (visibleKeys.has(k)) continue;
+    if (expanded.secrets.has(k)) {
+      entries.push(s);
+      visibleKeys.add(k);
+    }
+  }
 
   el.innerHTML = entries
     .map((s, i) => {
@@ -1760,7 +1778,9 @@ function renderSecrets() {
       ` : ""}
     </div>`;
     })
-    .join("");
+    .join("") + loadMoreButtonHtml("secrets", entries.length, allEntries.length);
+
+  wireLoadMoreButton(el, "secrets", renderSecrets);
 
   el.querySelectorAll(".row-head[data-kind='secrets']").forEach((head) => {
     head.addEventListener("dblclick", (ev) => {

@@ -209,6 +209,14 @@ const KNOWN_RESOURCE_WORDS = new Set([
   "client", "subscriptions", "subscription", "tasks", "task", "reports", "report", "contacts", "contact"
 ]);
 
+// Palabras cuyo segmento numérico siguiente casi nunca es un identificador
+// de objeto -- es paginación, offset o límite. "page/3", "pagina/2" son el
+// mismo tipo de falso positivo que "?page=2" ya corregido para LFI, pero
+// acá aplica al detector de IDOR por path, que hasta ahora no lo filtraba.
+const KNOWN_NON_RESOURCE_WORDS = new Set([
+  "page", "pagina", "página", "p", "offset", "skip", "start", "limit", "size", "per_page", "perpage"
+]);
+
 function isEntityValue(v) {
   if (typeof v === "number" && Number.isFinite(v)) return true;
   if (typeof v === "string" && v.length > 0 && v.length < 64 && /^[a-zA-Z0-9_-]+$/.test(v)) return true;
@@ -643,6 +651,15 @@ function scoreIdorCandidate(candidate, data) {
     if (KNOWN_RESOURCE_WORDS.has(resourceSeg)) {
       signals.push(`nombre de recurso reconocible ("${resourceSeg}")`);
       score += 2;
+    } else if (KNOWN_NON_RESOURCE_WORDS.has(resourceSeg)) {
+      // "page/3", "pagina/2", etc. -- casi nunca es un ID de objeto real,
+      // es paginación. Penaliza en vez de solo omitir el bono, porque el
+      // resto de las señales (numérico, varios valores observados) igual
+      // suman puntos y sin esto el candidato terminaba en MED de todas
+      // formas -- mismo problema que "page" tenía para LFI antes de
+      // filtrarse por valor.
+      signals.push(`segmento precedido por "${resourceSeg}" -- probablemente paginación, no un ID de objeto`);
+      score -= 4;
     }
   } else {
     signals.push(`parámetro de query ("${candidate.param}"), no forma parte del path`);
@@ -694,14 +711,23 @@ function detectSequentialCandidates(urlHistory, data) {
   }
   const candidates = [];
   for (const [template, ids] of byTemplate.entries()) {
-    if (ids.size >= 2) {
-      const base = {
-        template,
-        observedIds: Array.from(ids),
-        confidence: ids.size >= 3 ? "high" : "medium", // se mantiene por compatibilidad
-      };
-      candidates.push(scoreIdorCandidate(base, data || { entitySeenInResponse: {} }));
-    }
+    if (ids.size < 2) continue;
+    // Dos o más {id} ADYACENTES (sin ninguna palabra de recurso entre
+    // medio, ej. "/blog/{id}/{id}/{id}/titulo") casi nunca es una cadena
+    // de recursos REST anidados -- esos SIEMPRE alternan nombre-de-recurso
+    // e id ("/orgs/{id}/projects/{id}"). Lo típico detrás de {id}/{id}
+    // pegados es una fecha en el path (YYYY/MM/DD) u otra tupla de
+    // coordenadas -- no hay un único ID que tenga sentido "swapear" para
+    // probar IDOR ahí, así que se excluye el template entero en vez de
+    // generar un candidato de baja confianza por cada fecha distinta
+    // visitada.
+    if (template.split("/").some((seg, i, arr) => seg === "{id}" && arr[i + 1] === "{id}")) continue;
+    const base = {
+      template,
+      observedIds: Array.from(ids),
+      confidence: ids.size >= 3 ? "high" : "medium", // se mantiene por compatibilidad
+    };
+    candidates.push(scoreIdorCandidate(base, data || { entitySeenInResponse: {} }));
   }
   return candidates.sort((a, b) => b.score - a.score);
 }
