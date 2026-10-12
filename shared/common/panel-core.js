@@ -24,7 +24,7 @@ let nativePort = null;
 let getDomainFn = null;
 let currentMode = "passive"; // passive | assisted | active
 let currentScope = null; // { programName, allow: [], deny: [] } | null (no configurado)
-const expanded = { endpoints: new Set(), params: new Set(), jwt: new Set(), secrets: new Set(), idor: new Set(), treeIds: new Set(), treeNodes: new Set(), responseSample: new Set(), cors: new Set(), corsExtra: new Map(), graphql: new Set(), sourcemaps: new Set(), tech: new Set() };
+const expanded = { endpoints: new Set(), params: new Set(), jwt: new Set(), secrets: new Set(), idor: new Set(), race: new Set(), treeIds: new Set(), treeNodes: new Set(), responseSample: new Set(), cors: new Set(), corsExtra: new Map(), graphql: new Set(), sourcemaps: new Set(), tech: new Set() };
 
 // Resultado de "Probar CORS ahora", en memoria (nunca se persiste a
 // storage -- es una prueba puntual, no un hallazgo capturado). Sin esto,
@@ -623,7 +623,7 @@ function clearPanelError() {
 }
 
 function emptyData(domain) {
-  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], securityHeaderFindings: [], oauthFlows: {}, oauthFindings: [], idorCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, entitySeenInResponse: {}, reflectedValues: {}, dismissedFindings: {}, secretStatus: {}, graphqlOperations: {}, graphqlIntrospection: [], techFingerprint: {}, sourceMaps: {} };
+  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], securityHeaderFindings: [], oauthFlows: {}, oauthFindings: [], idorCandidates: [], raceCandidates: {}, notes: [], entityGraph: { nodes: {}, edges: {} }, entitySeenInResponse: {}, reflectedValues: {}, dismissedFindings: {}, secretStatus: {}, graphqlOperations: {}, graphqlIntrospection: [], techFingerprint: {}, sourceMaps: {} };
 }
 
 // ---- Severidad multi-plataforma: traducción de nuestra escala interna
@@ -691,6 +691,12 @@ const VALIDATION_CHECKLISTS = {
     "Confirmado que la directiva relajada (unsafe-inline/unsafe-eval) es explotable desde ese punto de inyección",
     "Probado un payload concreto, no solo la configuración en abstracto",
   ],
+  race_condition: [
+    "Disparado el mismo request real N veces en paralelo de verdad (Burp 'Send group in parallel', Turbo Intruder con race-single-packet, o ffuf con -c/-p en 0)",
+    "Confirmado el efecto doble en el backend real (saldo descontado 2 veces, cupón canjeado 2 veces, stock bajó de más), no solo 2 respuestas 200",
+    "Probado tanto con la misma sesión repetida como, si aplica, intentando ganar la carrera contra el propio chequeo de estado (ej. leer saldo -> gastar)",
+    "Descartado que el backend ya serialice la operación (lock a nivel de fila/idempotency key) antes de reportarlo como confirmado",
+  ],
 };
 
 function buildValidationChecklist(kind) {
@@ -748,6 +754,7 @@ function render() {
     renderEndpoints();
     renderParams();
     renderIdor();
+    renderRace();
     renderEntidades();
     renderJwt();
     renderSourceMaps();
@@ -797,6 +804,7 @@ function computeDomainPriorityScore(data) {
   score += (data.securityHeaderFindings || []).filter(isActiveSevere).length * 10;
   score += (data.oauthFindings || []).filter(isActiveSevere).length * 10;
   score += (data.idorCandidates || []).filter((c) => c.level === "HIGH").length * 8;
+  score += Object.values(data.raceCandidates || {}).filter((c) => c.level === "HIGH").length * 8;
   score += (data.secrets || []).filter((s) => !dismissed[s.match + s.source]).length * 8;
   score += computeSuggestedChains(data).length * 5;
   return score;
@@ -1462,6 +1470,128 @@ function renderIdor() {
       document.getElementById("tab-endpoints").classList.add("active");
       document.getElementById("cli-section").open = true;
       document.getElementById("cli-section").scrollIntoView({ behavior: "smooth" });
+    });
+  });
+}
+
+// ---- Race conditions (candidatos) --------------------------------------
+const RACE_WINDOW_MS_DISPLAY = 300;
+
+function buildRaceTestSpec(c) {
+  const gapTxt = Number.isFinite(c.minGapMs) ? `${c.minGapMs}ms` : "<1ms";
+  return [
+    `Endpoint:`,
+    `${c.method} ${c.url}`,
+    ``,
+    `Señal observada (pasiva, en tráfico normal):`,
+    `${c.pairCount} par(es) de requests casi simultáneas al mismo endpoint, gap mínimo ${gapTxt}, dentro de una ventana de ${RACE_WINDOW_MS_DISPLAY}ms`,
+    `Body: ${c.sampleBodies?.length ? "idéntico entre las requests emparejadas" : "vacío en ambas (acción identificada solo por sesión/path)"}`,
+    `Endpoint con nombre de impacto sensible (dinero/cupón/voto/etc.): ${c.sensitive ? "sí" : "no"}`,
+    ``,
+    `Suggested test:`,
+    `Repetir el MISMO request real ${Math.max(c.pairCount + 1, 5)}-10 veces en paralelo de verdad (no secuencial) y comparar el estado resultante contra una sola ejecución.`,
+    ``,
+    `Qué falta demostrar:`,
+    buildValidationChecklist("race_condition"),
+  ].join("\n");
+}
+
+function buildRaceBurpRequest(c) {
+  let u;
+  try {
+    u = new URL(c.url);
+  } catch {
+    return `${c.method} ${c.url} HTTP/1.1`;
+  }
+  const bodySample = (c.sampleBodies && c.sampleBodies[0]) || "";
+  const lines = [`${c.method} ${u.pathname}${u.search} HTTP/1.1`, `Host: ${u.host}`, `Cookie: <tu sesión actual>`];
+  if (bodySample) {
+    lines.push(`Content-Type: application/json`);
+    lines.push(``);
+    lines.push(bodySample);
+  } else {
+    lines.push(``);
+  }
+  lines.push(``);
+  lines.push(`# Pegá esto varias veces en Repeater, seleccioná todas las tabs y usá "Send group in parallel" (o Turbo Intruder con el script race-single-packet-attack) para dispararlas al mismo tiempo de verdad.`);
+  return lines.join("\n");
+}
+
+function raceCandidatesSorted() {
+  return Object.values(currentData.raceCandidates || {}).sort((a, b) => b.confidence - a.confidence);
+}
+
+function renderRace() {
+  const el = document.getElementById("race-list");
+  if (!el) return;
+  const entries = raceCandidatesSorted();
+  if (!entries.length) return (el.innerHTML = `<div class="empty">Sin candidatos a race condition detectados aún. Necesita tráfico de escritura (POST/PUT/PATCH/DELETE) real -- navegá el flujo normal (canjear, votar, agregar al carrito, etc.), inclusive con algún doble clic o reintento, para que aparezca algo acá.</div>`);
+  el.innerHTML = entries
+    .map((c, i) => {
+      const isOpen = expanded.race.has(c.epKey);
+      return `<div class="row">
+      <div class="row-head" style="display:flex;justify-content:space-between;align-items:center">
+        <span class="title mono">⚡ ${escapeHtml(c.method)} ${escapeHtml(c.url)}</span>
+        ${levelBadge(c.level)}
+      </div>
+      <div class="hint" style="margin-top:4px"><b>Confidence:</b> ${c.confidence}% · <b>Endpoint sensible:</b> ${c.sensitive ? "sí" : "no"}</div>
+      <div class="hint" style="margin-top:6px"><b>Señal:</b> ${c.pairCount} par(es) de requests casi simultáneas con body idéntico o vacío, gap mínimo ${Number.isFinite(c.minGapMs) ? c.minGapMs : 0}ms</div>
+      <div class="detail-actions" style="margin-top:8px">
+        <button class="btn-race-prepare" data-idx="${i}">${isOpen ? "Ocultar validación sugerida" : "Ver validación sugerida"}</button>
+      </div>
+      ${isOpen ? `
+        <div class="detail">
+          <pre class="mono" data-scroll-key="race-spec-${escapeHtml(c.epKey)}" style="background:var(--bg);padding:8px;border-radius:4px;overflow-x:auto">${escapeHtml(buildRaceTestSpec(c))}</pre>
+          <div class="detail-actions">
+            <button class="btn-race-copy" data-idx="${i}">Enviar a Burp (copiar)</button>
+            <button class="btn-race-create" data-idx="${i}">Crear hallazgo</button>
+          </div>
+        </div>
+      ` : ""}
+    </div>`;
+    })
+    .join("");
+
+  el.querySelectorAll(".btn-race-prepare").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const c = entries[Number(btn.dataset.idx)];
+      expanded.race.has(c.epKey) ? expanded.race.delete(c.epKey) : expanded.race.add(c.epKey);
+      renderRace();
+    });
+  });
+
+  el.querySelectorAll(".btn-race-copy").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const idx = Number(btn.dataset.idx);
+      const c = entries[idx];
+      try {
+        await navigator.clipboard.writeText(buildRaceBurpRequest(c));
+        const liveBtn = el.querySelector(`.btn-race-copy[data-idx="${idx}"]`);
+        if (liveBtn) {
+          liveBtn.textContent = "Copiado ✓ (pegalo en Repeater)";
+          setTimeout(() => (liveBtn.textContent = "Enviar a Burp (copiar)"), 2000);
+        }
+      } catch {}
+    });
+  });
+
+  el.querySelectorAll(".btn-race-create").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const c = entries[Number(btn.dataset.idx)];
+      const severityMap = { HIGH: "High", MED: "Medium", LOW: "Low" };
+      currentData.notes = currentData.notes || [];
+      currentData.notes.unshift({
+        title: `Race condition candidato: ${c.method} ${c.url}`,
+        severity: severityMap[c.level] || "Medium",
+        body: buildRaceTestSpec(c) + `\n\nConfidence: ${c.confidence}% (no confirmado — pendiente de validación activa)`,
+        createdAt: Date.now(),
+      });
+      saveCurrent();
+      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+      document.querySelectorAll(".tab-content").forEach((c) => c.classList.remove("active"));
+      document.querySelector(".tab-btn[data-tab='notes']").classList.add("active");
+      document.getElementById("tab-notes").classList.add("active");
+      render();
     });
   });
 }
@@ -2873,6 +3003,7 @@ function buildReconSummary(data) {
     ["Endpoints capturados", Object.keys(data.endpoints || {}).length],
     ["Parámetros distintos", Object.keys(data.params || {}).length],
     ["Candidatos IDOR", (data.idorCandidates || []).length],
+    ["Candidatos a race condition", Object.keys(data.raceCandidates || {}).length],
     ["Secretos detectados", (data.secrets || []).length],
     ["JWTs vistos", (data.jwts || []).length],
     ["Hallazgos CORS/CSP/headers", (data.corsFindings || []).length + (data.cspFindings || []).length + (data.securityHeaderFindings || []).length],

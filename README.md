@@ -170,6 +170,32 @@ deprecados, campos con nombre de dato sensible, enums/inputs/interfaces/
 uniones, y las mutations con nombre de acción destructiva marcadas como
 candidatas prioritarias a revisar autorización.
 
+### ⚡ Race Conditions
+Candidatos detectados 100% pasivamente: **nunca duplica ni reenvía ningún
+request**, solo observa el tráfico de escritura (POST/PUT/PATCH/DELETE)
+que ya generás navegando normalmente. Agrupa por endpoint (método + path,
+sin query) y marca cuando dos o más requests al mismo endpoint llegaron
+con body igual (o vacío en ambas) dentro de una ventana menor a 300ms —
+patrón clásico de canjear un cupón dos veces, retirar fondos en paralelo,
+votar/reclamar dos veces o aplicar un descuento repetido. Es la categoría
+de bug más activa en bug bounty hoy y la que casi nadie revisa a mano,
+porque no deja rastro visible salvo mirando timing real de tráfico.
+
+Cada candidato trae **confidence % real** (nunca 100%, es análisis
+pasivo: un doble clic accidental o un retry automático del cliente
+generan el mismo patrón), que sube si el endpoint tiene nombre de
+impacto directo (cupón, retiro, transferencia, checkout, voto, saldo,
+reembolso, carrito...) y si el gap entre requests fue muy chico. Cada
+tarjeta tiene:
+- **"Ver validación sugerida"**: arma la especificación del test
+  (endpoint, señal observada, qué falta demostrar antes de reportarlo
+  como confirmado)
+- **"Enviar a Burp"**: copia un request en texto crudo (con el body de
+  la muestra si lo hay) listo para pegar en Repeater y disparar en paralelo
+  ("Send group in parallel") o para usar como base en Turbo Intruder
+- **"Crear hallazgo"**: pre-completa la pestaña **Notas/Reporte** con
+título, severidad y el detalle completo
+
 ### 🧬 Tecnología
 Fingerprinting 100% pasivo de framework/CMS/servidor/WAF, antes de decidir
 qué payloads probar. Combina tres fuentes que ven cosas distintas: headers
@@ -189,7 +215,8 @@ que valen la pena probar juntas, no aisladas (SSRF candidato + secreto
 AWS visto → probar metadata de instancia; CORS crítico + endpoint
 autenticado; IDOR de alta confianza + entidad correlacionada con más
 recursos; mutation GraphQL + JWT débil; source map con secretos dentro;
-OAuth sin PKCE + Open Redirect candidato). Cada regla exige **dos**
+OAuth sin PKCE + Open Redirect candidato; race condition de alta
+confianza en endpoint sensible). Cada regla exige **dos**
 señales concretas en la misma sesión, nunca una sola pista aislada — son
 hipótesis para que las valides vos, no hallazgos confirmados.
 

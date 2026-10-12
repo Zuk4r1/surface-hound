@@ -32,6 +32,7 @@
     <button class="tab-btn" data-tab="endpoints">Endpoints</button>
     <button class="tab-btn" data-tab="params">Parámetros</button>
     <button class="tab-btn" data-tab="idor">IDOR</button>
+    <button class="tab-btn" data-tab="race">Race Conditions</button>
     <button class="tab-btn" data-tab="entidades">Entidades</button>
     <button class="tab-btn" data-tab="jwt">JWT</button>
     <button class="tab-btn" data-tab="secrets">Secretos</button>
@@ -74,6 +75,10 @@
     </section>
     <section id="tab-params" class="tab-content"><div id="params-list"></div></section>
     <section id="tab-idor" class="tab-content"><div id="idor-list"></div></section>
+    <section id="tab-race" class="tab-content">
+      <div class="hint" style="margin-bottom:8px">Detección 100% pasiva: NUNCA se duplica ni reenvía ningún request. Se observa el tráfico de escritura (POST/PUT/PATCH/DELETE) ya generado por el uso normal del sitio, y se marca cuando el mismo endpoint recibió 2+ requests con body igual o vacío en ambas dentro de una ventana muy chica (&lt;300ms) -- doble clic, un retry del cliente o una pestaña duplicada también generan este patrón, así que es un candidato a validar activamente (disparando requests concurrentes de verdad), nunca un hallazgo confirmado por sí solo.</div>
+      <div id="race-list"></div>
+    </section>
     <section id="tab-entidades" class="tab-content">
       <div class="hint" style="margin-bottom:8px">Entidades (IDs) vistas en URLs y cuerpos JSON, correlacionadas cuando aparecen juntas en el mismo payload. Útil para detectar acceso horizontal entre tenants/organizaciones.</div>
       <div id="entidades-list"></div>
@@ -98,7 +103,7 @@
       <div id="tech-list"></div>
     </section>
     <section id="tab-chains" class="tab-content">
-      <div class="hint" style="margin-bottom:8px">Cruces automáticos entre pestañas (IDOR, Entidades, Secretos, GraphQL, OAuth, CORS) cuando dos señales concretas coinciden en la misma sesión. Nunca ejecuta nada — son hipótesis para validar vos, no hallazgos confirmados.</div>
+      <div class="hint" style="margin-bottom:8px">Cruces automáticos entre pestañas (IDOR, Race Conditions, Entidades, Secretos, GraphQL, OAuth, CORS) cuando dos señales concretas coinciden en la misma sesión. Nunca ejecuta nada — son hipótesis para validar vos, no hallazgos confirmados.</div>
       <div id="chains-list"></div>
     </section>
     <section id="tab-scope" class="tab-content">

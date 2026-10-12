@@ -741,6 +741,142 @@ function buildAllIdorCandidates(urlHistory, data) {
   return [...pathCandidates, ...queryCandidates].sort((a, b) => b.score - a.score);
 }
 
+// ---- Race conditions ---------------------------------------------------
+//
+// Detección 100% pasiva: no se reenvía ni duplica ningún request. Se
+// observa el tráfico normal ya generado por la navegación/uso de la app y
+// se busca el patrón "el mismo endpoint de escritura (POST/PUT/PATCH/
+// DELETE) recibió 2+ requests con body igual o muy similar en una ventana
+// de tiempo muy chica" -- doble clic accidental, un retry automático del
+// cliente, o una pestaña duplicada generan tráfico casi idéntico de forma
+// normal, así que esto es un CANDIDATO a validar activamente (disparando
+// requests concurrentes de verdad con Burp/Turbo Intruder/ffuf), nunca un
+// hallazgo confirmado por sí solo. No reemplaza ese paso activo.
+//
+// Ventana elegida (300ms): suficientemente chica para que sea improbable
+// que dos clics humanos deliberados caigan ahí por casualidad, pero
+// suficientemente amplia para cubrir "doble clic + fetch" real en una red
+// normal (no solo el caso ideal de 0ms en requests disparados a propósito
+// con Promise.all).
+const RACE_WINDOW_MS = 300;
+
+// Igual que SENSITIVE_AUTH_PATH_RE pero para operaciones de ESTADO/dinero,
+// no de autenticación -- acá nos importa qué endpoints tienen impacto real
+// si se ejecutan dos veces (canjear un cupón dos veces, retirar fondos en
+// paralelo), no si tienen rate limiting. Incluye español e inglés porque
+// el tráfico real de bug bounty mezcla ambos según el target.
+const RACE_SENSITIVE_PATH_RE = /\/(cupon|coupon|cupones|coupons|canjear|redeem|redimir|descuento|discount|aplicar|apply|retirar|retiro|withdraw|withdrawal|transferir|transferencia|transfer|checkout|pago|payment|payout|pedido|order|orders|votar|voto|vote|vot(e|ing)|reclamar|claim|saldo|balance|reembolso|refund|carrito|cart|comprar|purchase|canje|invite|invitacion|invitation|referral|referido)(\/|\?|$)/i;
+
+// Buffer efímero en memoria (NO persistido, se pierde al recargar la
+// extensión) con las últimas requests de escritura vistas por dominio --
+// mismo patrón que urlHistoryByDomain. Solo necesitamos una ventana corta
+// de tiempo real, no historial: se poda en cada inserción por tamaño Y por
+// antigüedad, para no acumular memoria en una sesión de navegación larga.
+const raceBufferByDomain = new Map();
+const RACE_BUFFER_MAX_PER_DOMAIN = 400;
+const RACE_BUFFER_MAX_AGE_MS = 15000;
+
+// Normaliza un body para comparar "igual o muy similar" sin que el orden
+// de las claves de un JSON (que varía entre requests idénticas en la
+// práctica, ej. por reordenamiento del framework del cliente) genere falsos
+// negativos. Si no es JSON parseable, se compara como texto recortado --
+// suficiente para bodies tipo form-urlencoded cortos, que es lo típico en
+// endpoints de "canjear"/"votar".
+function normalizeBodyForCompare(bodyText) {
+  if (!bodyText) return "";
+  try {
+    const parsed = JSON.parse(bodyText);
+    const sortKeys = (v) => {
+      if (Array.isArray(v)) return v.map(sortKeys);
+      if (v && typeof v === "object") {
+        return Object.keys(v)
+          .sort()
+          .reduce((acc, k) => ((acc[k] = sortKeys(v[k])), acc), {});
+      }
+      return v;
+    };
+    return JSON.stringify(sortKeys(parsed));
+  } catch {
+    return bodyText.trim().slice(0, 500);
+  }
+}
+
+function recordRaceSample(domain, sample) {
+  if (!raceBufferByDomain.has(domain)) raceBufferByDomain.set(domain, []);
+  const buf = raceBufferByDomain.get(domain);
+  buf.push(sample);
+  const cutoff = sample.timestamp - RACE_BUFFER_MAX_AGE_MS;
+  let i = 0;
+  while (i < buf.length && buf[i].timestamp < cutoff) i++;
+  if (i > 0) buf.splice(0, i);
+  if (buf.length > RACE_BUFFER_MAX_PER_DOMAIN) buf.splice(0, buf.length - RACE_BUFFER_MAX_PER_DOMAIN);
+}
+
+function scoreRaceCandidate(cand) {
+  let score = 25 + Math.min(cand.pairCount, 4) * 15;
+  if (cand.sensitive) score += 20;
+  if (cand.minGapMs <= 50) score += 15;
+  else if (cand.minGapMs <= 150) score += 8;
+  score = Math.min(97, score);
+  const level = score >= 65 ? "HIGH" : score >= 42 ? "MED" : "LOW";
+  return { ...cand, confidence: score, level };
+}
+
+const RACE_COMPARE_WINDOW = 25;
+
+function detectRaceCandidates(domain, existingCandidates) {
+  const buf = raceBufferByDomain.get(domain) || [];
+  const byEndpoint = new Map();
+  for (const s of buf) {
+    if (!byEndpoint.has(s.epKey)) byEndpoint.set(s.epKey, []);
+    byEndpoint.get(s.epKey).push(s);
+  }
+
+  const result = { ...(existingCandidates || {}) };
+  for (const [epKey, samples] of byEndpoint.entries()) {
+    const recent = samples.slice(-RACE_COMPARE_WINDOW);
+    let pairCount = 0;
+    let minGapMs = Infinity;
+    const matchedBodies = [];
+    const matchedTimestamps = [];
+    for (let a = 0; a < recent.length; a++) {
+      for (let b = a + 1; b < recent.length; b++) {
+        const gap = Math.abs(recent[a].timestamp - recent[b].timestamp);
+        if (gap > RACE_WINDOW_MS) continue;
+        const bothEmpty = !recent[a].hasBody && !recent[b].hasBody;
+        const sameBody = recent[a].hasBody && recent[b].hasBody && recent[a].bodyNorm === recent[b].bodyNorm;
+        if (!bothEmpty && !sameBody) continue;
+        pairCount++;
+        minGapMs = Math.min(minGapMs, gap);
+        if (matchedTimestamps.length < 6) matchedTimestamps.push([recent[a].timestamp, recent[b].timestamp]);
+        if (sameBody && matchedBodies.length < 2 && recent[a].bodyNorm) matchedBodies.push(recent[a].bodyNorm.slice(0, 300));
+      }
+    }
+    if (!pairCount) continue;
+
+    const sample = recent[recent.length - 1];
+    let pathOnly = "";
+    try { pathOnly = new URL(sample.url).pathname; } catch { pathOnly = sample.url.split("?")[0]; }
+    const sensitive = RACE_SENSITIVE_PATH_RE.test(pathOnly);
+
+    const prior = result[epKey];
+    const base = {
+      epKey,
+      url: sample.url,
+      method: sample.method,
+      pairCount: Math.max(pairCount, prior?.pairCount || 0),
+      minGapMs: Math.min(minGapMs, prior?.minGapMs ?? Infinity),
+      sensitive,
+      sampleBodies: matchedBodies.length ? matchedBodies : prior?.sampleBodies || [],
+      sampleTimestamps: matchedTimestamps.length ? matchedTimestamps : prior?.sampleTimestamps || [],
+      lastSeen: Date.now(),
+      firstSeen: prior?.firstSeen || Date.now(),
+    };
+    result[epKey] = scoreRaceCandidate(base);
+  }
+  return result;
+}
+
 // ---- JWT --------------------------------------------------------------
 
 const JWT_RE = /eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]*/g;
@@ -1192,6 +1328,7 @@ async function getDomainData(domain) {
     corsFindings: [],
     cspFindings: [],
     idorCandidates: [],
+    raceCandidates: {},
     notes: [],
     entitySeenInResponse: {},
     reflectedValues: {},
@@ -2012,6 +2149,18 @@ async function handleNetEvent(msg) {
     const jsSource = summarizeStack(msg.stack);
     if (jsSource) ep.jsSource = jsSource;
     if (msg.responseBody) ep.sampleResponseBody = msg.responseBody.slice(0, 400);
+
+    if (method !== "GET" && method !== "HEAD") {
+      recordRaceSample(domain, {
+        epKey,
+        url: msg.url,
+        method,
+        timestamp: msg.capturedAt || Date.now(),
+        bodyNorm: normalizeBodyForCompare(msg.requestBody),
+        hasBody: !!msg.requestBody,
+      });
+      data.raceCandidates = detectRaceCandidates(domain, data.raceCandidates);
+    }
 
     // Extraer entidades del body de request/response y de la URL
     let reqEntities = [], resEntities = [];
