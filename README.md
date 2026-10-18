@@ -196,6 +196,38 @@ tarjeta tiene:
 - **"Crear hallazgo"**: pre-completa la pestaña **Notas/Reporte** con
 título, severidad y el detalle completo
 
+### 🔀 Comparación de versiones de API
+Correlación pasiva entre endpoints que son **el mismo recurso en distinta
+versión** (ej. `/api/v1/users/{id}` y `/api/v2/users/{id}`), agrupados por
+método + plantilla de path (ids numéricos/UUID también se normalizan a
+`{id}`, así que distintos usuarios no rompen el agrupamiento). Patrón
+clásico de OWASP API9:2023 "Improper Inventory Management": una versión
+vieja queda viva con menos validación mientras el cliente real ya migró
+a la nueva, y nadie la revisa porque no aparece en ningún flujo actual
+de la UI.
+
+Para cada grupo con 2+ versiones vistas en tráfico real compara:
+- **hasAuth observado** (¿se vio `Authorization`/`Cookie` en alguna
+  request a esa versión?) — la señal de más valor es cuando **difiere
+  entre versiones**
+- **Último status code** — si la versión sin auth observada igual
+  devolvió `2xx`, sube la confianza fuerte (no es solo "todavía no se
+  probó con sesión", es indicio real de acceso sin autenticación)
+
+Cada candidato trae **confidence % real** (nunca 100%: "hasAuth: no
+observado" solo significa que no se capturó tráfico autenticado a esa
+versión todavía, no que el endpoint no lo exija) y botones para **"Ver
+validación sugerida"**, **"Enviar a Burp"** (arma las requests crudas de
+todas las versiones, una por cada una, listas para comparar en pestañas
+de Repeater) y **"Crear hallazgo"**.
+
+**Limitación conocida:** solo detecta versionado **por path** (`/v1/`,
+`/v2/`, `/version2/`...). No cubre versionado por header
+(`Accept-Version`, content negotiation) ni por subdominio
+(`api-v1.ejemplo.com` vs `api-v2.ejemplo.com`) — y solo aparece algo si
+ya navegaste/usaste ambas versiones, no inventa tráfico a versiones
+viejas que el sitio nunca sirvió en tu sesión.
+
 ### 🧬 Tecnología
 Fingerprinting 100% pasivo de framework/CMS/servidor/WAF, antes de decidir
 qué payloads probar. Combina tres fuentes que ven cosas distintas: headers
