@@ -741,6 +741,92 @@ function buildAllIdorCandidates(urlHistory, data) {
   return [...pathCandidates, ...queryCandidates].sort((a, b) => b.score - a.score);
 }
 
+// ---- Comparación pasiva de versiones de API ----------------------------
+const VERSION_SEGMENT_RE = /\/(v|ver|version)(\d{1,3})(\.\d{1,3})?(?=[/?#]|$)/i;
+
+function buildApiVersionTemplate(pathOnly) {
+  const match = pathOnly.match(VERSION_SEGMENT_RE);
+  if (!match) return null;
+  return {
+    template: pathOnly.replace(VERSION_SEGMENT_RE, "/{version}").replace(ID_SEGMENT_RE, "/{id}"),
+    version: match[0].slice(1).toLowerCase(),
+  };
+}
+
+function apiVersionSortKey(label) {
+  const match = label.match(/(\d{1,3})(?:\.(\d{1,3}))?/);
+  return match ? [Number(match[1]), Number(match[2] || 0)] : [0, 0];
+}
+
+function scoreApiVersionCandidate(groupKey, versionsMap) {
+  const versions = Array.from(versionsMap.values()).sort((a, b) => {
+    const ka = apiVersionSortKey(a.version), kb = apiVersionSortKey(b.version);
+    return ka[0] - kb[0] || ka[1] - kb[1];
+  });
+  const hasAuthVersions = versions.filter((v) => v.hasAuth);
+  const noAuthVersions = versions.filter((v) => !v.hasAuth);
+  const authDiffers = hasAuthVersions.length > 0 && noAuthVersions.length > 0;
+  const openConfirmed = noAuthVersions.some((v) => typeof v.status === "number" && v.status >= 200 && v.status < 300);
+  const openHitsOk = noAuthVersions.some((v) => v.hits >= 2);
+
+  let confidence = 20;
+  if (authDiffers) confidence += 25;
+  if (openConfirmed) confidence += 30;
+  if (openHitsOk) confidence += 10;
+  if (versions.length >= 3) confidence += 5;
+  confidence = Math.min(96, confidence);
+
+  return {
+    groupKey,
+    method: versions[0].method,
+    template: groupKey.split(" ").slice(1).join(" "),
+    versions,
+    authDiffers,
+    openConfirmed,
+    confidence,
+    level: confidence >= 65 ? "HIGH" : confidence >= 40 ? "MED" : "LOW",
+  };
+}
+
+function buildApiVersionCandidates(data) {
+  const groups = new Map();
+  for (const endpoint of Object.values(data.endpoints || {})) {
+    if (!endpoint.url) continue;
+    let pathname, host;
+    try {
+      const url = new URL(endpoint.url);
+      pathname = url.pathname;
+      host = url.host;
+    } catch {
+      pathname = endpoint.url.split("?")[0];
+      host = "";
+    }
+    const versioned = buildApiVersionTemplate(pathname);
+    if (!versioned) continue;
+
+    const method = (endpoint.method || "GET").toUpperCase();
+    const groupKey = `${method} ${host}${versioned.template}`;
+    if (!groups.has(groupKey)) groups.set(groupKey, new Map());
+    const versions = groups.get(groupKey);
+    const candidate = {
+      version: versioned.version,
+      url: endpoint.url,
+      method,
+      hasAuth: !!endpoint.hasAuth,
+      status: endpoint.status,
+      hits: endpoint.hits || 0,
+      lastSeen: endpoint.lastSeen,
+    };
+    const existing = versions.get(versioned.version);
+    if (!existing || candidate.hits > existing.hits) versions.set(versioned.version, candidate);
+  }
+
+  return Array.from(groups.entries())
+    .filter(([, versions]) => versions.size >= 2)
+    .map(([groupKey, versions]) => scoreApiVersionCandidate(groupKey, versions))
+    .sort((a, b) => b.confidence - a.confidence);
+}
+
 // ---- Race conditions ---------------------------------------------------
 //
 // Detección 100% pasiva: no se reenvía ni duplica ningún request. Se
@@ -767,6 +853,14 @@ const RACE_WINDOW_MS = 300;
 // el tráfico real de bug bounty mezcla ambos según el target.
 const RACE_SENSITIVE_PATH_RE = /\/(cupon|coupon|cupones|coupons|canjear|redeem|redimir|descuento|discount|aplicar|apply|retirar|retiro|withdraw|withdrawal|transferir|transferencia|transfer|checkout|pago|payment|payout|pedido|order|orders|votar|voto|vote|vot(e|ing)|reclamar|claim|saldo|balance|reembolso|refund|carrito|cart|comprar|purchase|canje|invite|invitacion|invitation|referral|referido)(\/|\?|$)/i;
 
+const RACE_DEDUPE_REJECTION_STATUSES = new Set([400, 403, 409, 423, 425, 429]);
+const RACE_DEDUPE_HINT_RE = /\b(already|duplicate|duplicado|ya\s+(fue|se|está)|idempoten\w*|conflict|too\s+many\s+requests|one[-\s]?time|locked|en\s+proceso|in\s+progress)\b/i;
+const RACE_VOLATILE_BODY_KEYS = new Set([
+  "timestamp", "ts", "_t", "time", "nonce", "requestid", "request_id",
+  "clientrequestid", "client_request_id", "traceid", "trace_id",
+  "correlationid", "correlation_id", "clienttime", "sentat", "sent_at",
+]);
+
 // Buffer efímero en memoria (NO persistido, se pierde al recargar la
 // extensión) con las últimas requests de escritura vistas por dominio --
 // mismo patrón que urlHistoryByDomain. Solo necesitamos una ventana corta
@@ -782,7 +876,7 @@ const RACE_BUFFER_MAX_AGE_MS = 15000;
 // negativos. Si no es JSON parseable, se compara como texto recortado --
 // suficiente para bodies tipo form-urlencoded cortos, que es lo típico en
 // endpoints de "canjear"/"votar".
-function normalizeBodyForCompare(bodyText) {
+function normalizeBodyForCompare(bodyText, stripVolatile = false) {
   if (!bodyText) return "";
   try {
     const parsed = JSON.parse(bodyText);
@@ -790,6 +884,7 @@ function normalizeBodyForCompare(bodyText) {
       if (Array.isArray(v)) return v.map(sortKeys);
       if (v && typeof v === "object") {
         return Object.keys(v)
+          .filter((k) => !stripVolatile || !RACE_VOLATILE_BODY_KEYS.has(k.toLowerCase()))
           .sort()
           .reduce((acc, k) => ((acc[k] = sortKeys(v[k])), acc), {});
       }
@@ -812,14 +907,49 @@ function recordRaceSample(domain, sample) {
   if (buf.length > RACE_BUFFER_MAX_PER_DOMAIN) buf.splice(0, buf.length - RACE_BUFFER_MAX_PER_DOMAIN);
 }
 
+function classifyRacePairOutcome(a, b) {
+  const sa = a.status, sb = b.status;
+  if (typeof sa !== "number" || typeof sb !== "number") return "unknown";
+  const aOk = sa >= 200 && sa < 300;
+  const bOk = sb >= 200 && sb < 300;
+  if (aOk && bOk) return "bothSuccess";
+  const aRejected = RACE_DEDUPE_REJECTION_STATUSES.has(sa);
+  const bRejected = RACE_DEDUPE_REJECTION_STATUSES.has(sb);
+  if ((aOk && bRejected) || (bOk && aRejected)) return "splitOutcome";
+  if (!aOk && !bOk) return "bothRejected";
+  return "unknown";
+}
+
+function racePairHasDedupeHint(a, b) {
+  return RACE_DEDUPE_HINT_RE.test(a.respSnippet || "") || RACE_DEDUPE_HINT_RE.test(b.respSnippet || "");
+}
+
 function scoreRaceCandidate(cand) {
-  let score = 25 + Math.min(cand.pairCount, 4) * 15;
-  if (cand.sensitive) score += 20;
+  let score = 18 + Math.min(cand.exactPairCount || 0, 4) * 13 + Math.min(cand.fuzzyPairCount || 0, 4) * 6;
+  if (cand.sensitive) score += 18;
   if (cand.minGapMs <= 50) score += 15;
   else if (cand.minGapMs <= 150) score += 8;
-  score = Math.min(97, score);
-  const level = score >= 65 ? "HIGH" : score >= 42 ? "MED" : "LOW";
-  return { ...cand, confidence: score, level };
+
+  const outcomes = cand.outcomeCounts || {};
+  const bothSuccess = outcomes.bothSuccess || 0;
+  const splitOutcome = outcomes.splitOutcome || 0;
+  let outcomeNote = null;
+
+  if (bothSuccess > 0) {
+    score += 30;
+    outcomeNote = "confirmed_both_success";
+  } else if (splitOutcome > 0 || (cand.dedupeHintCount || 0) > 0) {
+    score -= 35;
+    outcomeNote = "likely_protected";
+  }
+
+  if (bothSuccess === 0 && (cand.sampleCount || 0) >= 15 && (cand.pairCount || 0) <= 1) {
+    score -= 15;
+  }
+
+  score = Math.max(3, Math.min(97, score));
+  const level = score >= 65 ? "HIGH" : score >= 40 ? "MED" : "LOW";
+  return { ...cand, confidence: score, level, outcomeNote };
 }
 
 const RACE_COMPARE_WINDOW = 25;
@@ -835,8 +965,9 @@ function detectRaceCandidates(domain, existingCandidates) {
   const result = { ...(existingCandidates || {}) };
   for (const [epKey, samples] of byEndpoint.entries()) {
     const recent = samples.slice(-RACE_COMPARE_WINDOW);
-    let pairCount = 0;
+    let pairCount = 0, exactPairCount = 0, fuzzyPairCount = 0, dedupeHintCount = 0;
     let minGapMs = Infinity;
+    const outcomeCounts = {};
     const matchedBodies = [];
     const matchedTimestamps = [];
     for (let a = 0; a < recent.length; a++) {
@@ -844,12 +975,17 @@ function detectRaceCandidates(domain, existingCandidates) {
         const gap = Math.abs(recent[a].timestamp - recent[b].timestamp);
         if (gap > RACE_WINDOW_MS) continue;
         const bothEmpty = !recent[a].hasBody && !recent[b].hasBody;
-        const sameBody = recent[a].hasBody && recent[b].hasBody && recent[a].bodyNorm === recent[b].bodyNorm;
-        if (!bothEmpty && !sameBody) continue;
+        const exactMatch = recent[a].hasBody && recent[b].hasBody && recent[a].bodyNormExact === recent[b].bodyNormExact;
+        const fuzzyMatch = !exactMatch && recent[a].hasBody && recent[b].hasBody && recent[a].bodyNormFuzzy === recent[b].bodyNormFuzzy;
+        if (!bothEmpty && !exactMatch && !fuzzyMatch) continue;
         pairCount++;
+        if (fuzzyMatch) fuzzyPairCount++; else exactPairCount++;
         minGapMs = Math.min(minGapMs, gap);
+        const outcome = classifyRacePairOutcome(recent[a], recent[b]);
+        outcomeCounts[outcome] = (outcomeCounts[outcome] || 0) + 1;
+        if (racePairHasDedupeHint(recent[a], recent[b])) dedupeHintCount++;
         if (matchedTimestamps.length < 6) matchedTimestamps.push([recent[a].timestamp, recent[b].timestamp]);
-        if (sameBody && matchedBodies.length < 2 && recent[a].bodyNorm) matchedBodies.push(recent[a].bodyNorm.slice(0, 300));
+        if (exactMatch && matchedBodies.length < 2 && recent[a].bodyNormExact) matchedBodies.push(recent[a].bodyNormExact.slice(0, 300));
       }
     }
     if (!pairCount) continue;
@@ -860,11 +996,20 @@ function detectRaceCandidates(domain, existingCandidates) {
     const sensitive = RACE_SENSITIVE_PATH_RE.test(pathOnly);
 
     const prior = result[epKey];
+    const mergedOutcomes = { ...(prior?.outcomeCounts || {}) };
+    for (const [k, v] of Object.entries(outcomeCounts)) mergedOutcomes[k] = Math.max(mergedOutcomes[k] || 0, v);
     const base = {
       epKey,
       url: sample.url,
       method: sample.method,
       pairCount: Math.max(pairCount, prior?.pairCount || 0),
+      exactPairCount: Math.max(exactPairCount, prior?.exactPairCount || 0),
+      fuzzyPairCount: Math.max(fuzzyPairCount, prior?.fuzzyPairCount || 0),
+      dedupeHintCount: Math.max(dedupeHintCount, prior?.dedupeHintCount || 0),
+      outcomeCounts: mergedOutcomes,
+      sampleCount: Math.max(samples.length, prior?.sampleCount || 0),
+      matchTier: exactPairCount > 0 || prior?.matchTier === "exact" ? "exact" : "fuzzy",
+      bodyMatched: exactPairCount > 0 || fuzzyPairCount > 0 || !!prior?.bodyMatched,
       minGapMs: Math.min(minGapMs, prior?.minGapMs ?? Infinity),
       sensitive,
       sampleBodies: matchedBodies.length ? matchedBodies : prior?.sampleBodies || [],
@@ -1329,6 +1474,7 @@ async function getDomainData(domain) {
     cspFindings: [],
     idorCandidates: [],
     raceCandidates: {},
+    apiVersionCandidates: [],
     notes: [],
     entitySeenInResponse: {},
     reflectedValues: {},
@@ -1918,6 +2064,7 @@ async function upsertEndpoint(domain, url, method) {
     if (hist.length > 500) hist.splice(0, hist.length - 500); // cap de memoria
     ensureEntityGraph(data);
     data.idorCandidates = buildAllIdorCandidates(hist, data);
+    data.apiVersionCandidates = buildApiVersionCandidates(data);
 
     await saveDomainData(domain, data);
   });
@@ -1972,6 +2119,7 @@ ext.webRequest.onSendHeaders.addListener(
           };
         }
         data.endpoints[epKey].hasAuth = true;
+        data.apiVersionCandidates = buildApiVersionCandidates(data);
       }
       if (jwts.length) {
         // Antes: un token ya visto se descartaba entero (dedup por
@@ -2142,7 +2290,10 @@ async function handleNetEvent(msg) {
     }
     const ep = data.endpoints[epKey];
     ep.lastSeen = Date.now();
-    if (msg.status !== undefined) ep.status = msg.status;
+    if (msg.status !== undefined) {
+      ep.status = msg.status;
+      data.apiVersionCandidates = buildApiVersionCandidates(data);
+    }
     if (msg.contentType) ep.contentType = msg.contentType;
     if (msg.responseSize != null) ep.responseSize = msg.responseSize;
     if (msg.pageUrl) ep.sourcePage = msg.pageUrl;
@@ -2156,8 +2307,11 @@ async function handleNetEvent(msg) {
         url: msg.url,
         method,
         timestamp: msg.capturedAt || Date.now(),
-        bodyNorm: normalizeBodyForCompare(msg.requestBody),
+        bodyNormExact: normalizeBodyForCompare(msg.requestBody, false),
+        bodyNormFuzzy: normalizeBodyForCompare(msg.requestBody, true),
         hasBody: !!msg.requestBody,
+        status: typeof msg.status === "number" ? msg.status : null,
+        respSnippet: (msg.responseBody || "").slice(0, 300),
       });
       data.raceCandidates = detectRaceCandidates(domain, data.raceCandidates);
     }

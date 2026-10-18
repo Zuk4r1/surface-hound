@@ -40,7 +40,9 @@ ALLOWED_ACTIONS = {
     "nuclei":    ["nuclei", "-u", "{target}", "-silent", "-jsonl", "-timeout", "8"],
     "arjun":     ["arjun", "-u", "{target}", "-oT", "{extra_output_file}"],
     "dalfox":    ["dalfox", "url", "{target}", "--silence"],
-    "gau":       ["gau", "{target_host}"],
+    # "--" marca el host como argumento posicional y evita que gau lo
+    # interprete como una opción si la validación del host cambia en el futuro.
+    "gau":       ["gau", "--", "{target_host}"],
     "ffuf":      ["ffuf", "-u", "{target}/FUZZ", "-w", "/usr/share/seclists/Discovery/Web-Content/common.txt", "-s"],
     "httpx":     ["httpx", "-u", "{target}", "-silent", "-title", "-tech-detect", "-status-code"],
     "katana":    ["katana", "-u", "{target}", "-silent", "-depth", "2"],
@@ -61,7 +63,10 @@ MAX_OUTPUT_LINES = 5000   # corta el proceso si se desborda de output (evita flo
 MAX_JOBS_HISTORY = 50     # jobs terminados más viejos que esto se podan de memoria
 
 URL_RE = re.compile(r"^https?://[a-zA-Z0-9.\-]+(:\d+)?(/[^\s]*)?$")
-HOST_RE = re.compile(r"^[a-zA-Z0-9.\-]+$")
+# Un hostname válido no empieza con guion. Rechazarlo también evita que
+# herramientas que reciben el host como argumento posicional lo interpreten
+# como una opción (argument injection, CWE-88).
+HOST_RE = re.compile(r"^(?!-)[a-zA-Z0-9.\-]+$")
 
 jobs = {}            # job_id -> dict con status/proceso/metadata
 jobs_lock = threading.Lock()

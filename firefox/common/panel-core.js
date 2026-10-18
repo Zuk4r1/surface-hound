@@ -24,7 +24,7 @@ let nativePort = null;
 let getDomainFn = null;
 let currentMode = "passive"; // passive | assisted | active
 let currentScope = null; // { programName, allow: [], deny: [] } | null (no configurado)
-const expanded = { endpoints: new Set(), params: new Set(), jwt: new Set(), secrets: new Set(), idor: new Set(), treeIds: new Set(), treeNodes: new Set(), responseSample: new Set(), cors: new Set(), corsExtra: new Map(), graphql: new Set(), sourcemaps: new Set(), tech: new Set() };
+const expanded = { endpoints: new Set(), params: new Set(), jwt: new Set(), secrets: new Set(), idor: new Set(), race: new Set(), apiVersions: new Set(), treeIds: new Set(), treeNodes: new Set(), responseSample: new Set(), cors: new Set(), corsExtra: new Map(), graphql: new Set(), sourcemaps: new Set(), tech: new Set() };
 
 // Resultado de "Probar CORS ahora", en memoria (nunca se persiste a
 // storage -- es una prueba puntual, no un hallazgo capturado). Sin esto,
@@ -623,7 +623,7 @@ function clearPanelError() {
 }
 
 function emptyData(domain) {
-  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], securityHeaderFindings: [], oauthFlows: {}, oauthFindings: [], idorCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, entitySeenInResponse: {}, reflectedValues: {}, dismissedFindings: {}, secretStatus: {}, graphqlOperations: {}, graphqlIntrospection: [], techFingerprint: {}, sourceMaps: {} };
+  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], securityHeaderFindings: [], oauthFlows: {}, oauthFindings: [], idorCandidates: [], raceCandidates: {}, apiVersionCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, entitySeenInResponse: {}, reflectedValues: {}, dismissedFindings: {}, secretStatus: {}, graphqlOperations: {}, graphqlIntrospection: [], techFingerprint: {}, sourceMaps: {} };
 }
 
 // ---- Severidad multi-plataforma: traducción de nuestra escala interna
@@ -691,6 +691,18 @@ const VALIDATION_CHECKLISTS = {
     "Confirmado que la directiva relajada (unsafe-inline/unsafe-eval) es explotable desde ese punto de inyección",
     "Probado un payload concreto, no solo la configuración en abstracto",
   ],
+  race_condition: [
+    "Disparado el mismo request real N veces en paralelo de verdad (Burp 'Send group in parallel', Turbo Intruder con race-single-packet, o ffuf con -c/-p en 0)",
+    "Confirmado el efecto doble en el backend real (saldo descontado 2 veces, cupón canjeado 2 veces, stock bajó de más), no solo 2 respuestas 200",
+    "Probado tanto con la misma sesión repetida como, si aplica, intentando ganar la carrera contra el propio chequeo de estado (ej. leer saldo -> gastar)",
+    "Descartado que el backend ya serialice la operación (lock a nivel de fila/idempotency key) antes de reportarlo como confirmado",
+  ],
+  api_version_diff: [
+    "Repetido el request a la versión vieja SIN mandar Authorization/Cookie y confirmado el status code real (no asumido por lo observado pasivamente)",
+    "Comparada la respuesta completa entre versiones (campos devueltos, no solo el status) -- una versión vieja puede exigir auth pero devolver más datos de los que debería igual",
+    "Probado también con una sesión de OTRO usuario/rol en la versión vieja, no solo sin sesión -- a veces el control que falta es de autorización (acceso a datos ajenos), no de autenticación",
+    "Confirmado que la versión vieja sigue activa en producción ahora mismo (no es un endpoint ya dado de baja que solo quedó en el historial del navegador)",
+  ],
 };
 
 function buildValidationChecklist(kind) {
@@ -748,6 +760,8 @@ function render() {
     renderEndpoints();
     renderParams();
     renderIdor();
+    renderRace();
+    renderApiVersions();
     renderEntidades();
     renderJwt();
     renderSourceMaps();
@@ -797,6 +811,8 @@ function computeDomainPriorityScore(data) {
   score += (data.securityHeaderFindings || []).filter(isActiveSevere).length * 10;
   score += (data.oauthFindings || []).filter(isActiveSevere).length * 10;
   score += (data.idorCandidates || []).filter((c) => c.level === "HIGH").length * 8;
+  score += Object.values(data.raceCandidates || {}).filter((c) => c.level === "HIGH").length * 8;
+  score += (data.apiVersionCandidates || []).filter((c) => c.level === "HIGH").length * 8;
   score += (data.secrets || []).filter((s) => !dismissed[s.match + s.source]).length * 8;
   score += computeSuggestedChains(data).length * 5;
   return score;
@@ -1466,6 +1482,278 @@ function renderIdor() {
   });
 }
 
+// ---- Race conditions (candidatos) --------------------------------------
+const RACE_WINDOW_MS_DISPLAY = 300;
+
+function raceOutcomeNoteText(c) {
+  if (c.outcomeNote === "confirmed_both_success") {
+    return "Ambas respuestas del par fueron 2xx. Esto indica que el servidor aceptó ambas requests, pero confirma el doble efecto solo si verificás el estado resultante del backend.";
+  }
+  if (c.outcomeNote === "likely_protected") {
+    return "⚠ Señal de que el backend pudo detectar la duplicación (una respuesta 2xx y la otra 400/403/409/423/425/429, o un mensaje tipo \"already\"/\"duplicate\" en el body). Probablemente protegido; validá el estado final antes de priorizarlo.";
+  }
+  return "No se pudo determinar el desenlace por status code de ambas respuestas; solo se observó el patrón de timing y body.";
+}
+
+function buildRaceTestSpec(c) {
+  const gapTxt = Number.isFinite(c.minGapMs) ? `${c.minGapMs}ms` : "<1ms";
+  const matchTierTxt = c.matchTier === "fuzzy"
+    ? "similar (coincide salvo campos típicamente volátiles como timestamp/nonce/requestId)"
+    : "idéntico";
+  return [
+    `Endpoint:`,
+    `${c.method} ${c.url}`,
+    ``,
+    `Señal observada (pasiva, en tráfico normal):`,
+    `${c.pairCount} par(es) de requests casi simultáneas al mismo endpoint, gap mínimo ${gapTxt}, dentro de una ventana de ${RACE_WINDOW_MS_DISPLAY}ms`,
+    `Body: ${c.bodyMatched || c.sampleBodies?.length ? `${matchTierTxt} entre las requests emparejadas` : "vacío en ambas (acción identificada solo por sesión/path)"}`,
+    `Endpoint con nombre de impacto sensible (dinero/cupón/voto/etc.): ${c.sensitive ? "sí" : "no"}`,
+    `Desenlace según status code: ${raceOutcomeNoteText(c)}`,
+    ``,
+    `Suggested test:`,
+    `Repetir el MISMO request real ${Math.max(c.pairCount + 1, 5)}-10 veces en paralelo de verdad (no secuencial) y comparar el estado resultante contra una sola ejecución.`,
+    ``,
+    `Qué falta demostrar:`,
+    buildValidationChecklist("race_condition"),
+  ].join("\n");
+}
+
+function buildRaceBurpRequest(c) {
+  let u;
+  try {
+    u = new URL(c.url);
+  } catch {
+    return `${c.method} ${c.url} HTTP/1.1`;
+  }
+  const bodySample = (c.sampleBodies && c.sampleBodies[0]) || "";
+  const lines = [`${c.method} ${u.pathname}${u.search} HTTP/1.1`, `Host: ${u.host}`, `Cookie: <tu sesión actual>`];
+  if (bodySample) {
+    lines.push(`Content-Type: application/json`);
+    lines.push(``);
+    lines.push(bodySample);
+  } else {
+    lines.push(``);
+  }
+  lines.push(``);
+  lines.push(`# Pegá esto varias veces en Repeater, seleccioná todas las tabs y usá "Send group in parallel" (o Turbo Intruder con el script race-single-packet-attack) para dispararlas al mismo tiempo de verdad.`);
+  return lines.join("\n");
+}
+
+function raceCandidatesSorted() {
+  return Object.values(currentData.raceCandidates || {}).sort((a, b) => b.confidence - a.confidence);
+}
+
+function renderRace() {
+  const el = document.getElementById("race-list");
+  if (!el) return;
+  const entries = raceCandidatesSorted();
+  if (!entries.length) return (el.innerHTML = `<div class="empty">Sin candidatos a race condition detectados aún. Necesita tráfico de escritura (POST/PUT/PATCH/DELETE) real -- navegá el flujo normal (canjear, votar, agregar al carrito, etc.), inclusive con algún doble clic o reintento, para que aparezca algo acá.</div>`);
+  el.innerHTML = entries
+    .map((c, i) => {
+      const isOpen = expanded.race.has(c.epKey);
+      return `<div class="row">
+      <div class="row-head" style="display:flex;justify-content:space-between;align-items:center">
+        <span class="title mono">⚡ ${escapeHtml(c.method)} ${escapeHtml(c.url)}</span>
+        ${levelBadge(c.level)}
+      </div>
+      <div class="hint" style="margin-top:4px"><b>Confidence:</b> ${c.confidence}% · <b>Endpoint sensible:</b> ${c.sensitive ? "sí" : "no"}${c.matchTier === "fuzzy" ? ` · <span class="badge info">match fuzzy</span>` : ""}</div>
+      <div class="hint" style="margin-top:6px"><b>Señal:</b> ${c.pairCount} par(es) de requests casi simultáneas con body ${c.matchTier === "fuzzy" ? "similar" : "idéntico"} o vacío, gap mínimo ${Number.isFinite(c.minGapMs) ? c.minGapMs : 0}ms</div>
+      ${c.outcomeNote === "confirmed_both_success" ? `<div class="hint" style="margin-top:4px"><span class="badge critical">ambas respuestas 2xx</span> confirmar el efecto revisando el estado final</div>` : ""}
+      ${c.outcomeNote === "likely_protected" ? `<div class="hint" style="margin-top:4px"><span class="badge info">probablemente protegido</span> el backend pudo detectar la duplicación</div>` : ""}
+      <div class="detail-actions" style="margin-top:8px">
+        <button class="btn-prepare-race-test" data-idx="${i}">${isOpen ? "Ocultar validación sugerida" : "Ver validación sugerida"}</button>
+      </div>
+      ${isOpen ? `
+        <div class="detail">
+          <div class="hint" style="margin-bottom:4px"><b>Suggested validation</b></div>
+          <pre class="mono" data-scroll-key="race-spec-${escapeHtml(c.epKey)}" style="background:var(--bg);padding:8px;border-radius:4px;overflow-x:auto">${escapeHtml(buildRaceTestSpec(c))}</pre>
+          <div class="detail-actions">
+            <button class="btn-copy-race-burp" data-idx="${i}">Enviar a Burp (copiar)</button>
+            <button class="btn-create-race-finding" data-idx="${i}">Crear hallazgo</button>
+          </div>
+        </div>
+      ` : ""}
+    </div>`;
+    })
+    .join("");
+
+  el.querySelectorAll(".btn-prepare-race-test").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const c = entries[Number(btn.dataset.idx)];
+      expanded.race.has(c.epKey) ? expanded.race.delete(c.epKey) : expanded.race.add(c.epKey);
+      renderRace();
+    });
+  });
+
+  el.querySelectorAll(".btn-copy-race-burp").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const idx = btn.dataset.idx;
+      const c = entries[Number(idx)];
+      try {
+        await navigator.clipboard.writeText(buildRaceBurpRequest(c));
+        const liveBtn = el.querySelector(`.btn-copy-race-burp[data-idx="${idx}"]`);
+        if (liveBtn) {
+          liveBtn.textContent = "Copiado ✓ (pegalo en Repeater)";
+          setTimeout(() => (liveBtn.textContent = "Enviar a Burp (copiar)"), 2000);
+        }
+      } catch {
+        // clipboard puede fallar sin permiso de foco; no rompe el resto del panel
+      }
+    });
+  });
+
+  el.querySelectorAll(".btn-create-race-finding").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const c = entries[Number(btn.dataset.idx)];
+      const severityMap = { HIGH: "High", MED: "Medium", LOW: "Low" };
+      currentData.notes = currentData.notes || [];
+      currentData.notes.unshift({
+        title: `Race condition candidato: ${c.method} ${c.url}`,
+        severity: severityMap[c.level] || "Medium",
+        body: buildRaceTestSpec(c) + `\n\nConfidence: ${c.confidence}% (no confirmado — pendiente de validación activa con requests concurrentes reales)`,
+        createdAt: Date.now(),
+      });
+      saveCurrent();
+      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+      document.querySelectorAll(".tab-content").forEach((c) => c.classList.remove("active"));
+      document.querySelector(".tab-btn[data-tab='notes']").classList.add("active");
+      document.getElementById("tab-notes").classList.add("active");
+      render();
+    });
+  });
+}
+
+// ---- Comparación de versiones de API ------------------------------------
+
+function buildApiVersionTestSpec(c) {
+  const rows = c.versions
+    .map((v) => `  ${v.version.padEnd(8)} hasAuth observado: ${v.hasAuth ? "sí" : "no"} · último status: ${v.status ?? "?"} · hits: ${v.hits} · ${v.url}`)
+    .join("\n");
+  return [
+    `Recurso (plantilla): ${c.method} ${c.template}`,
+    ``,
+    `Versiones vistas en tráfico real:`,
+    rows,
+    ``,
+    `Señal observada:`,
+    c.authDiffers
+      ? "Al menos una versión mostró auth (Authorization/Cookie) en el tráfico capturado y otra NO, para el mismo recurso."
+      : "Mismo recurso en 2+ versiones distintas vivas al mismo tiempo (sin diferencia de auth observada todavía).",
+    c.openConfirmed
+      ? "Además, la versión sin auth observada devolvió un status 2xx -- indicio fuerte de acceso real sin autenticación, no solo falta de tráfico autenticado capturado."
+      : "Ojo: 'hasAuth: no' acá solo significa que todavía no se capturó un request autenticado a esa versión -- no confirma por sí solo que el endpoint no la exija.",
+    ``,
+    `Suggested test:`,
+    `Repetir el mismo request a la versión más vieja SIN headers de sesión y comparar status + body contra la versión nueva (con y sin sesión).`,
+    ``,
+    `Qué falta demostrar:`,
+    buildValidationChecklist("api_version_diff"),
+  ].join("\n");
+}
+
+function buildApiVersionBurpRequests(c) {
+  return c.versions.map((v) => {
+    let url;
+    try { url = new URL(v.url); } catch { return `${v.method} ${v.url} HTTP/1.1`; }
+    const lines = [
+      `### ${v.version} (hasAuth observado: ${v.hasAuth ? "sí" : "no"}, último status: ${v.status ?? "?"})`,
+      `${v.method} ${url.pathname}${url.search} HTTP/1.1`,
+      `Host: ${url.host}`,
+      v.hasAuth ? "Cookie: <tu sesión actual>" : "# (probar primero SIN Cookie/Authorization -- es lo que se observó pasivamente)",
+      "",
+    ];
+    return lines.join("\n");
+  }).join("\n");
+}
+
+function apiVersionCandidatesSorted() {
+  return [...(currentData.apiVersionCandidates || [])].sort((a, b) => b.confidence - a.confidence);
+}
+
+function renderApiVersions() {
+  const el = document.getElementById("apiversions-list");
+  if (!el) return;
+  const entries = apiVersionCandidatesSorted();
+  if (!entries.length) {
+    el.innerHTML = `<div class="empty">Sin candidatos todavía. Hace falta haber visto en tráfico real al menos 2 versiones distintas del mismo recurso (ej. /api/v1/users/{id} y /api/v2/users/{id}) -- si el sitio solo usa una versión en el path, o versiona por header/subdominio, acá no va a aparecer nada.</div>`;
+    return;
+  }
+  el.innerHTML = entries.map((c, i) => {
+    const isOpen = expanded.apiVersions.has(c.groupKey);
+    const versionRows = c.versions.map((v) => `<tr>
+      <td class="mono" style="padding:3px 8px 3px 0">${escapeHtml(v.version)}</td>
+      <td style="padding:3px 8px">${v.hasAuth ? '<span class="badge medium">sí</span>' : '<span class="badge info">no observado</span>'}</td>
+      <td class="mono" style="padding:3px 8px">${v.status ?? "?"}</td>
+      <td style="padding:3px 8px">${v.hits}</td>
+    </tr>`).join("");
+    return `<div class="row">
+      <div class="row-head" style="display:flex;justify-content:space-between;align-items:center">
+        <span class="title mono">🔀 ${escapeHtml(c.method)} ${escapeHtml(c.template)}</span>
+        ${levelBadge(c.level)}
+      </div>
+      <div class="hint" style="margin-top:4px"><b>Confidence:</b> ${c.confidence}% · <b>CWE:</b> CWE-284 · OWASP API9:2023</div>
+      <div class="hint" style="margin-top:4px">${c.versions.length} versiones vistas${c.authDiffers ? " · <b>hasAuth difiere entre versiones</b>" : ""}${c.openConfirmed ? " · <b>versión sin auth respondió 2xx</b>" : ""}</div>
+      <table class="mono" style="width:100%;margin-top:6px;font-size:12px;border-collapse:collapse">
+        <thead><tr><th style="text-align:left;padding:3px 8px 3px 0">Versión</th><th style="text-align:left;padding:3px 8px">hasAuth</th><th style="text-align:left;padding:3px 8px">Status</th><th style="text-align:left;padding:3px 8px">Hits</th></tr></thead>
+        <tbody>${versionRows}</tbody>
+      </table>
+      <div class="detail-actions" style="margin-top:8px">
+        <button class="btn-prepare-apiv-test" data-idx="${i}">${isOpen ? "Ocultar validación sugerida" : "Ver validación sugerida"}</button>
+      </div>
+      ${isOpen ? `<div class="detail">
+        <div class="hint" style="margin-bottom:4px"><b>Suggested validation</b></div>
+        <pre class="mono" data-scroll-key="apiv-spec-${escapeHtml(c.groupKey)}" style="background:var(--bg);padding:8px;border-radius:4px;overflow-x:auto">${escapeHtml(buildApiVersionTestSpec(c))}</pre>
+        <div class="detail-actions">
+          <button class="btn-copy-apiv-burp" data-idx="${i}">Enviar a Burp (copiar)</button>
+          <button class="btn-create-apiv-finding" data-idx="${i}">Crear hallazgo</button>
+        </div>
+      </div>` : ""}
+    </div>`;
+  }).join("");
+
+  el.querySelectorAll(".btn-prepare-apiv-test").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const candidate = entries[Number(btn.dataset.idx)];
+      expanded.apiVersions.has(candidate.groupKey) ? expanded.apiVersions.delete(candidate.groupKey) : expanded.apiVersions.add(candidate.groupKey);
+      renderApiVersions();
+    });
+  });
+  el.querySelectorAll(".btn-copy-apiv-burp").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const idx = btn.dataset.idx;
+      try {
+        await navigator.clipboard.writeText(buildApiVersionBurpRequests(entries[Number(idx)]));
+        const liveBtn = el.querySelector(`.btn-copy-apiv-burp[data-idx="${idx}"]`);
+        if (liveBtn) {
+          liveBtn.textContent = "Copiado ✓ (pegalo en Repeater, una tab por versión)";
+          setTimeout(() => (liveBtn.textContent = "Enviar a Burp (copiar)"), 2500);
+        }
+      } catch {
+        // clipboard puede fallar sin permiso de foco; no rompe el resto del panel
+      }
+    });
+  });
+  el.querySelectorAll(".btn-create-apiv-finding").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const c = entries[Number(btn.dataset.idx)];
+      const severityMap = { HIGH: "High", MED: "Medium", LOW: "Low" };
+      currentData.notes = currentData.notes || [];
+      currentData.notes.unshift({
+        title: `Comparación de versiones de API: ${c.method} ${c.template}`,
+        severity: severityMap[c.level] || "Medium",
+        body: buildApiVersionTestSpec(c) + `\n\nConfidence: ${c.confidence}% (no confirmado — pendiente de validación activa comparando ambas versiones a mano)`,
+        createdAt: Date.now(),
+      });
+      saveCurrent();
+      document.querySelectorAll(".tab-btn").forEach((tab) => tab.classList.remove("active"));
+      document.querySelectorAll(".tab-content").forEach((content) => content.classList.remove("active"));
+      document.querySelector(".tab-btn[data-tab='notes']").classList.add("active");
+      document.getElementById("tab-notes").classList.add("active");
+      render();
+    });
+  });
+}
+
 function tierBadge(tier) {
   const map = { OBSERVED: "info", SUSPICIOUS: "medium", CANDIDATE: "high", CONFIRMED: "critical" };
   return `<span class="badge ${map[tier] || "info"}">${tier}</span>`;
@@ -2103,6 +2391,24 @@ function computeSuggestedChains(data) {
       title: "Posible ausencia de rate limiting en endpoint sensible + JWT con hallazgo de nivel CANDIDATE",
       severity: "high",
       description: `"${rateLimitCandidate.url}" acumuló tráfico repetido sin ver nunca un 429, y por separado hay un JWT con hallazgos de nivel CANDIDATE (pestaña JWT). Sin throttling visible, un ataque de fuerza bruta o credential stuffing contra ese endpoint es más viable -- y si el JWT resulta forjable, un token obtenido así podría además manipularse para escalar privilegios en vez de quedar limitado a la cuenta comprometida.`,
+    });
+  }
+
+  const raceHigh = Object.values(data.raceCandidates || {}).find((candidate) => candidate.level === "HIGH");
+  if (raceHigh) {
+    chains.push({
+      title: "Candidato a race condition de alta confianza en endpoint sensible",
+      severity: "high",
+      description: `Se observaron ${raceHigh.pairCount} par(es) de requests casi simultáneas con body ${raceHigh.sampleBodies?.length ? "idéntico" : "vacío en ambas"} contra "${raceHigh.method} ${raceHigh.url}", un endpoint cuyo nombre sugiere impacto directo (dinero/cupón/voto/stock). Vale la pena priorizar la validación activa (requests concurrentes reales) acá antes que en candidatos de endpoints sin impacto de estado/dinero.`,
+    });
+  }
+
+  const apiVersionHigh = (data.apiVersionCandidates || []).find((candidate) => candidate.level === "HIGH");
+  if (apiVersionHigh) {
+    chains.push({
+      title: "Versión vieja de API con validación más débil que la actual",
+      severity: "high",
+      description: `"${apiVersionHigh.method} ${apiVersionHigh.template}" tiene ${apiVersionHigh.versions.length} versiones vivas al mismo tiempo (${apiVersionHigh.versions.map((v) => v.version).join(", ")})${apiVersionHigh.authDiffers ? ", y hasAuth difiere entre ellas" : ""}${apiVersionHigh.openConfirmed ? " -- la versión sin auth observada ya respondió 2xx" : ""}. Patrón clásico OWASP API9:2023: la versión vieja queda viva con menos controles mientras el cliente real ya migró a la nueva.`,
     });
   }
 
@@ -2873,6 +3179,8 @@ function buildReconSummary(data) {
     ["Endpoints capturados", Object.keys(data.endpoints || {}).length],
     ["Parámetros distintos", Object.keys(data.params || {}).length],
     ["Candidatos IDOR", (data.idorCandidates || []).length],
+    ["Candidatos a race condition", Object.keys(data.raceCandidates || {}).length],
+    ["Candidatos de versiones de API", (data.apiVersionCandidates || []).length],
     ["Secretos detectados", (data.secrets || []).length],
     ["JWTs vistos", (data.jwts || []).length],
     ["Hallazgos CORS/CSP/headers", (data.corsFindings || []).length + (data.cspFindings || []).length + (data.securityHeaderFindings || []).length],
