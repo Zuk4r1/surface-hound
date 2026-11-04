@@ -181,87 +181,52 @@ votar/reclamar dos veces o aplicar un descuento repetido. Es la categoría
 de bug más activa en bug bounty hoy y la que casi nadie revisa a mano,
 porque no deja rastro visible salvo mirando timing real de tráfico.
 
-**Scoring v2, consciente del desenlace real (no solo timing+body):** cada
-par de requests casi simultáneas también se evalúa contra el status code
-real de ambas respuestas, que ya se captura de todos modos:
-- Si **ambas respuestas fueron 2xx**, sube fuerte la confianza: ambas
-  requests fueron aceptadas, aunque hay que verificar el estado final para
-  confirmar que el efecto de negocio se aplicó dos veces.
-- Si **una de las dos quedó rechazada** (400/403/409/423/425/429, o un
-  body con "already"/"duplicate"/"ya fue procesado"), el candidato se
-  marca explícitamente como **"probablemente protegido"** y baja fuerte la
-  confianza.
-- Un endpoint golpeado con mucha frecuencia (polling/heartbeat) con un
-  solo par detectado también se penaliza, porque es más probable una
-  coincidencia estadística.
-- La comparación de body tiene dos niveles: exacta, y fuzzy (ignora campos
-  volátiles típicos como `timestamp`/`nonce`/`requestId` que cambian en
-  cada request aunque la acción de negocio sea la misma).
-
 Cada candidato trae **confidence % real** (nunca 100%, es análisis
-pasivo), que sube si el endpoint tiene nombre de impacto directo (cupón,
-retiro, transferencia, checkout, voto, saldo, reembolso, carrito...) y si
-el gap entre requests fue muy chico. Cada tarjeta tiene:
+pasivo: un doble clic accidental o un retry automático del cliente
+generan el mismo patrón), que sube si el endpoint tiene nombre de
+impacto directo (cupón, retiro, transferencia, checkout, voto, saldo,
+reembolso, carrito...) y si el gap entre requests fue muy chico. Cada
+tarjeta tiene:
 - **"Ver validación sugerida"**: arma la especificación del test
   (endpoint, señal observada, qué falta demostrar antes de reportarlo
   como confirmado)
 - **"Enviar a Burp"**: copia un request en texto crudo (con el body de
-  muestra si lo hay) listo para pegar en Repeater y disparar en paralelo
+  la muestra si lo hay) listo para pegar en Repeater y disparar en paralelo
   ("Send group in parallel") o para usar como base en Turbo Intruder
 - **"Crear hallazgo"**: pre-completa la pestaña **Notas/Reporte** con
-  título, severidad y el detalle completo
+título, severidad y el detalle completo
 
 ### 🔀 Comparación de versiones de API
 Correlación pasiva entre endpoints que son **el mismo recurso en distinta
-versión**, agrupados por método + plantilla de recurso (ids numéricos/UUID
-se normalizan a `{id}`, así que distintos usuarios no rompen el
-agrupamiento). Patrón clásico de OWASP API9:2023 "Improper Inventory
-Management": una versión vieja queda viva con menos validación mientras
-el cliente real ya migró a la nueva, y nadie la revisa porque no aparece
-en ningún flujo actual de la UI.
+versión** (ej. `/api/v1/users/{id}` y `/api/v2/users/{id}`), agrupados por
+método + plantilla de path (ids numéricos/UUID también se normalizan a
+`{id}`, así que distintos usuarios no rompen el agrupamiento). Patrón
+clásico de OWASP API9:2023 "Improper Inventory Management": una versión
+vieja queda viva con menos validación mientras el cliente real ya migró
+a la nueva, y nadie la revisa porque no aparece en ningún flujo actual
+de la UI.
 
-**Tres formas de versionado detectadas** (en orden de confiabilidad):
-- **Por path** — `/api/v1/users/{id}` vs `/api/v2/users/{id}`
-- **Por subdominio** — `api-v1.ejemplo.com` vs `api-v2.ejemplo.com`
-- **Por query param explícito** — `?version=1` vs `?api_version=2` (con un
-  whitelist deliberadamente estricto de nombres de parámetro —
-  `version`/`api_version`/`apiversion`/`api-version` — para no confundir un `?v=` de
-  cache-busting o paginación con una versión real)
+Para cada grupo con 2+ versiones vistas en tráfico real compara:
+- **hasAuth observado** (¿se vio `Authorization`/`Cookie` en alguna
+  request a esa versión?) — la señal de más valor es cuando **difiere
+  entre versiones**
+- **Último status code** — si la versión sin auth observada igual
+  devolvió `2xx`, sube la confianza fuerte (no es solo "todavía no se
+  probó con sesión", es indicio real de acceso sin autenticación)
 
-**Con una sola versión vista** también aparece una tarjeta (confianza baja)
-para permitir una sonda activa de versiones vecinas. El botón **"Probar
-versiones candidatas"** funciona solo en modo Asistido/Activo y dentro del
-scope configurado. Envía hasta tres requests **GET sin credenciales** a
-versiones no observadas (por ejemplo, desde `v4` intenta `v1`, `v3` y
-`v5`) y muestra los status devueltos o los errores de red. Nunca sondea
-automáticamente ni prueba métodos de escritura (`POST`/`PUT`/`PATCH`/
-`DELETE`). Omite credenciales del navegador y elimina parámetros de query
-que parecen contener secretos; no sigue redirecciones fuera del destino
-sondeado. El resultado es temporal y no se guarda como tráfico capturado.
+Cada candidato trae **confidence % real** (nunca 100%: "hasAuth: no
+observado" solo significa que no se capturó tráfico autenticado a esa
+versión todavía, no que el endpoint no lo exija) y botones para **"Ver
+validación sugerida"**, **"Enviar a Burp"** (arma las requests crudas de
+todas las versiones, una por cada una, listas para comparar en pestañas
+de Repeater) y **"Crear hallazgo"**.
 
-Para cada grupo con 2+ versiones vistas en tráfico real compara, **por
-separado**, el status code de los requests **con** y **sin** auth de cada
-versión (correlacionado por request individual, no un "último status"
-único que se pisaba según cuál request pasara de último):
-- Si una versión respondió **2xx a requests sin auth** mientras otra solo
-  responde con auth presente, sube fuerte la confianza — es la señal de
-  más valor, y ahora está confirmada por status code real de ESE request
-  puntual, no inferida de un valor mezclado.
-- Si la única señal "sin auth" de la versión vieja es un **404/405/410/501**
-  (ruta inexistente o método no permitido), se marca como posible
-  **versión dada de baja** — no un problema de control de acceso — y la
-  confianza baja a propósito, en vez de mostrarse como un falso positivo
-  de severidad media.
-
-Cada candidato trae **confidence % real** (nunca 100%) y botones para
-**"Ver validación sugerida"**, **"Enviar a Burp"** (arma las requests
-crudas de todas las versiones, una por cada una, listas para comparar en
-pestañas de Repeater) y **"Crear hallazgo"**.
-
-**Limitación conocida:** no cubre versionado **por header**
-(`Accept-Version`, content negotiation). Las sondas activas solo sirven
-para métodos GET; un status 2xx es una respuesta de la versión candidata,
-no confirma por sí solo una exposición ni un impacto de seguridad.
+**Limitación conocida:** solo detecta versionado **por path** (`/v1/`,
+`/v2/`, `/version2/`...). No cubre versionado por header
+(`Accept-Version`, content negotiation) ni por subdominio
+(`api-v1.ejemplo.com` vs `api-v2.ejemplo.com`) — y solo aparece algo si
+ya navegaste/usaste ambas versiones, no inventa tráfico a versiones
+viejas que el sitio nunca sirvió en tu sesión.
 
 ### 🧬 Tecnología
 Fingerprinting 100% pasivo de framework/CMS/servidor/WAF, antes de decidir
@@ -283,8 +248,7 @@ AWS visto → probar metadata de instancia; CORS crítico + endpoint
 autenticado; IDOR de alta confianza + entidad correlacionada con más
 recursos; mutation GraphQL + JWT débil; source map con secretos dentro;
 OAuth sin PKCE + Open Redirect candidato; race condition de alta
-confianza en endpoint sensible; versión vieja de API con hasAuth
-distinto a la versión actual). Cada regla exige **dos**
+confianza en endpoint sensible). Cada regla exige **dos**
 señales concretas en la misma sesión, nunca una sola pista aislada — son
 hipótesis para que las valides vos, no hallazgos confirmados.
 
@@ -440,3 +404,4 @@ Creado con ❤️ por [@Zuk4r1](https://github.com/Zuk4r1).
 Si te resultan útiles mis herramientas, considera dar una ⭐ en GitHub o invitarme un café. ¡Gracias!
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/investigacq)  [![PayPal](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://www.paypal.me/yordansuarezrojas)
+

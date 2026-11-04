@@ -2408,6 +2408,7 @@ ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       recordTechFindings(data, msg.techSignals);
       recordSourceMapReferences(data, msg.sourceMaps);
+      recordJsIntel(data, msg.jsIntel, msg.pageUrl);
       await saveDomainData(domain, data);
     }).then(() => sendResponse({ ok: true }));
     return true;
@@ -2415,10 +2416,105 @@ ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "shx:netevent") {
     if (msg.source === "techfingerprint") handleTechFingerprintEvent(msg);
+    else if (msg.source === "jsintel") handleJsIntelEvent(msg);
     else handleNetEvent(msg);
     return false;
   }
 });
+
+
+// ---- JS Recon (v0.37): datos extraídos de bundles, postMessage y WebSocket ----
+// Todo es observación pasiva; los topes evitan que un sitio con bundles
+// enormes infle chrome.storage.local.
+const JSINTEL_CAPS = { endpoints: 800, cloud: 200, internal: 80, hosts: 200, params: 400, postMessage: 40, websockets: 30 };
+
+function ensureJsIntel(data) {
+  if (!data.jsIntel || typeof data.jsIntel !== "object" || Array.isArray(data.jsIntel)) data.jsIntel = {};
+  const j = data.jsIntel;
+  for (const k of ["endpoints", "cloud", "internal", "hosts", "postMessage", "websockets"]) {
+    if (!j[k] || typeof j[k] !== "object" || Array.isArray(j[k])) j[k] = {};
+  }
+  if (!Array.isArray(j.params)) j.params = [];
+  return j;
+}
+
+function mergeSources(rec, sources) {
+  rec.sources = rec.sources || [];
+  for (const src of sources || []) {
+    if (typeof src === "string" && rec.sources.length < 5 && !rec.sources.includes(src)) rec.sources.push(src.slice(0, 300));
+  }
+}
+
+function recordJsIntel(data, intel, pageUrl) {
+  if (!intel || typeof intel !== "object") return;
+  const j = ensureJsIntel(data);
+  const now = Date.now();
+  const putMap = (bucket, key, base, sources) => {
+    if (!isSafeObjectKey(key)) return;
+    const m = j[bucket];
+    if (!m[key]) {
+      if (Object.keys(m).length >= JSINTEL_CAPS[bucket]) return;
+      m[key] = { ...base, firstSeen: now, lastSeen: now };
+    } else {
+      m[key].lastSeen = now;
+    }
+    mergeSources(m[key], sources);
+  };
+  for (const e of Array.isArray(intel.endpoints) ? intel.endpoints : []) {
+    if (!e || typeof e.path !== "string") continue;
+    const key = (e.abs ? "abs:" + String(e.origin || "") : "rel:") + e.path.split("?")[0].slice(0, 200);
+    putMap("endpoints", key, { path: e.path.slice(0, 200), origin: String(e.origin || "").slice(0, 120), abs: !!e.abs, hint: !!e.hint }, e.sources);
+  }
+  for (const c of Array.isArray(intel.cloud) ? intel.cloud : []) {
+    if (!c || typeof c.value !== "string") continue;
+    putMap("cloud", String(c.kind).slice(0, 40) + "|" + c.value.slice(0, 160), { kind: String(c.kind).slice(0, 40), value: c.value.slice(0, 160), hint: String(c.hint || "").slice(0, 300) }, c.sources);
+  }
+  for (const i of Array.isArray(intel.internal) ? intel.internal : []) {
+    if (!i || typeof i.value !== "string") continue;
+    putMap("internal", i.value.slice(0, 80), { value: i.value.slice(0, 80) }, i.sources);
+  }
+  for (const h of Array.isArray(intel.hosts) ? intel.hosts : []) {
+    if (!h || typeof h.host !== "string") continue;
+    putMap("hosts", h.host.slice(0, 200), { host: h.host.slice(0, 200), envLike: !!h.envLike }, h.sources);
+  }
+  for (const name of Array.isArray(intel.params) ? intel.params : []) {
+    if (typeof name === "string" && isSafeObjectKey(name) && j.params.length < JSINTEL_CAPS.params && !j.params.includes(name)) j.params.push(name.slice(0, 40));
+  }
+  for (const pm of Array.isArray(intel.postMessage) ? intel.postMessage : []) {
+    if (!pm || typeof pm.sig !== "string") continue;
+    const key = simpleHash(pm.sig);
+    putMap("postMessage", key, {
+      level: ["HIGH", "MED", "LOW"].includes(pm.level) ? pm.level : "LOW",
+      checksOrigin: !!pm.checksOrigin,
+      usesData: !!pm.usesData,
+      sinks: (Array.isArray(pm.sinks) ? pm.sinks : []).slice(0, 8).map((x) => String(x).slice(0, 40)),
+      snippet: String(pm.snippet || "").slice(0, 400),
+      script: summarizeStack(pm.stack) || null,
+      page: String(pageUrl || "").slice(0, 300),
+    }, []);
+  }
+  for (const w of Array.isArray(intel.websockets) ? intel.websockets : []) {
+    if (!w || typeof w.url !== "string") continue;
+    putMap("websockets", w.url.slice(0, 300), {
+      url: w.url.slice(0, 300), protocols: w.protocols || null, tokenInUrl: !!w.tokenInUrl, insecure: !!w.insecure,
+      samples: [], script: summarizeStack(w.stack) || null,
+    }, []);
+  }
+  for (const smp of Array.isArray(intel.wsSamples) ? intel.wsSamples : []) {
+    const ws = j.websockets[String(smp?.url || "").slice(0, 300)];
+    if (ws && Array.isArray(ws.samples) && ws.samples.length < 3 && typeof smp.data === "string") ws.samples.push(smp.data.slice(0, 400));
+  }
+}
+
+async function handleJsIntelEvent(msg) {
+  const domain = extractDomain(msg.pageUrl || "");
+  if (!domain) return;
+  await withDomainLock(domain, async () => {
+    const data = await getDomainData(domain);
+    recordJsIntel(data, msg, msg.pageUrl);
+    await saveDomainData(domain, data);
+  });
+}
 
 async function handleTechFingerprintEvent(msg) {
   const domain = extractDomain(msg.pageUrl || "");

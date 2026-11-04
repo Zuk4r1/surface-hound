@@ -64,6 +64,26 @@
     return truncate(text);
   }
 
+
+  // Antes solo se capturaban bodies de tipo string -- los forms (FormData /
+  // URLSearchParams), muy comunes en login/checkout/cupones, quedaban sin
+  // body y por lo tanto invisibles para Race Conditions / entidades.
+  function serializeBody(body) {
+    try {
+      if (typeof body === "string") return body;
+      if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) return body.toString();
+      if (typeof FormData !== "undefined" && body instanceof FormData) {
+        const parts = [];
+        for (const [k, v] of body.entries()) {
+          parts.push(encodeURIComponent(k) + "=" + (typeof v === "string" ? encodeURIComponent(v.slice(0, 200)) : "[file]"));
+          if (parts.length >= 60) break;
+        }
+        return parts.join("&");
+      }
+    } catch {}
+    return null;
+  }
+
   // fetch('/api/users') con URL relativa es el caso MÁS COMÚN en SPAs reales
   // (casi nadie escribe la URL absoluta a mano). Sin resolverla, background.js
   // hace `new URL(url)` sobre un string relativo, que lanza, y el evento
@@ -120,7 +140,7 @@
       } catch {
         return origFetch.apply(this, arguments);
       }
-      const reqBody = typeof init?.body === "string" ? init.body : null;
+      const reqBody = serializeBody(init?.body);
       const stack = captureStack();
 
       return origFetch.apply(this, arguments).then(
@@ -170,7 +190,7 @@
 
       const origSend = xhr.send;
       xhr.send = function (body) {
-        _reqBody = typeof body === "string" ? body : null;
+        _reqBody = serializeBody(body);
         xhr.addEventListener("loadend", () => {
           try {
             const contentType = xhr.getResponseHeader("content-type") || "";
@@ -195,6 +215,83 @@
     PatchedXHR.prototype = OrigXHR.prototype;
     window.XMLHttpRequest = PatchedXHR;
   }
+
+  // ---- JS Recon dinámico (v0.37) -----------------------------------------
+  // (a) Listeners de postMessage: un handler que usa event.data sin validar
+  //     event.origin es la base de muchos DOM XSS / account takeover vía
+  //     postMessage. Se inspecciona el código fuente del handler (pasivo, no
+  //     se envía ningún mensaje) y se reporta como CANDIDATE, nunca confirmado.
+  const seenMsgHandlers = new Set();
+  const ORIGIN_CHECK_RE = /\.origin\b|\.source\s*(?:===|!==|==|!=)|isTrusted|allowedOrigins?|trustedOrigins?/;
+  const MSG_SINK_RE = /innerHTML|outerHTML|insertAdjacentHTML|document\.write|\beval\s*\(|new\s+Function|dangerouslySetInnerHTML|\.html\s*\(|location(?:\.href)?\s*=|\.src\s*=|\.href\s*=|localStorage\.setItem|sessionStorage\.setItem|postMessage\s*\(/g;
+
+  function auditMessageListener(fn) {
+    if (seenMsgHandlers.size >= 40) return;
+    let src;
+    try { src = Function.prototype.toString.call(fn); } catch { return; }
+    if (!src || src.includes("[native code]")) return;
+    src = src.slice(0, 20000);
+    const sig = src.length + ":" + src.slice(0, 80) + src.slice(-40);
+    if (seenMsgHandlers.has(sig)) return;
+    seenMsgHandlers.add(sig);
+    const checksOrigin = ORIGIN_CHECK_RE.test(src);
+    const sinks = [...new Set((src.match(MSG_SINK_RE) || []).map((x) => x.replace(/\s+/g, "")))].slice(0, 8);
+    if (checksOrigin && !sinks.length) return; // validado y sin sinks: ruido
+    const level = !checksOrigin && sinks.length ? "HIGH" : !checksOrigin ? "MED" : "LOW";
+    post({
+      source: "jsintel",
+      postMessage: [{
+        sig,
+        level,
+        checksOrigin,
+        sinks,
+        usesData: /\.data\b/.test(src),
+        snippet: src.slice(0, 400),
+        stack: captureStack(),
+      }],
+    });
+  }
+
+  try {
+    const origAdd = window.addEventListener;
+    window.addEventListener = function (type, listener) {
+      try {
+        if (type === "message") {
+          if (typeof listener === "function") auditMessageListener(listener);
+          else if (listener && typeof listener.handleEvent === "function") auditMessageListener(listener.handleEvent);
+        }
+      } catch {}
+      return origAdd.apply(this, arguments);
+    };
+  } catch {}
+
+  // (b) WebSocket: ni fetch ni XHR lo ven. Se registra URL, protocolo,
+  //     tokens en la query, ws:// sin TLS y las primeras tramas recibidas.
+  try {
+    const OrigWS = window.WebSocket;
+    if (OrigWS) {
+      const PatchedWS = function (url, protocols) {
+        const ws = protocols !== undefined ? new OrigWS(url, protocols) : new OrigWS(url);
+        try {
+          const wsUrl = String(ws.url || url);
+          const tokenInUrl = /[?&](?:token|access_token|auth|jwt|key|api_key|session|sid)=/i.test(wsUrl);
+          const insecure = /^ws:\/\//i.test(wsUrl) && location.protocol === "https:";
+          post({ source: "jsintel", websockets: [{ url: wsUrl.slice(0, 300), protocols: protocols === undefined ? null : String(protocols).slice(0, 80), tokenInUrl, insecure, samples: [], stack: captureStack() }] });
+          let n = 0;
+          ws.addEventListener("message", (ev) => {
+            if (n >= 3 || typeof ev.data !== "string") return;
+            n++;
+            post({ source: "jsintel", wsSamples: [{ url: wsUrl.slice(0, 300), data: truncate(ev.data, 400) }] });
+          });
+        } catch {}
+        return ws;
+      };
+      PatchedWS.prototype = OrigWS.prototype;
+      for (const k of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]) { try { PatchedWS[k] = OrigWS[k]; } catch {} }
+      window.WebSocket = PatchedWS;
+    }
+  } catch {}
+
   // ---- Fingerprinting de tecnología: variables JS globales (mundo MAIN) --
   // content.js (mundo aislado) comparte el DOM con la página pero NO sus
   // variables JS globales -- window.React ahí es undefined aunque React

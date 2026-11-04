@@ -40,6 +40,7 @@
     <button class="tab-btn" data-tab="cors">CORS/CSP</button>
     <button class="tab-btn" data-tab="graphql">GraphQL</button>
     <button class="tab-btn" data-tab="tech">Tecnología</button>
+    <button class="tab-btn" data-tab="jsrecon">JS Recon</button>
     <button class="tab-btn" data-tab="chains">Cadenas</button>
     <button class="tab-btn" data-tab="scope">Scope</button>
     <button class="tab-btn" data-tab="notes">Notas / Reporte</button>
@@ -106,6 +107,10 @@
     <section id="tab-tech" class="tab-content">
       <div class="hint" style="margin-bottom:8px">Detección 100% pasiva: headers de respuesta (Server, X-Powered-By), cookies características (PHPSESSID, laravel_session), firmas en el DOM, y variables JS globales. La confianza sube cuando más de una fuente corrobora la misma tecnología.</div>
       <div id="tech-list"></div>
+    </section>
+    <section id="tab-jsrecon" class="tab-content">
+      <div class="hint" style="margin-bottom:8px">Inteligencia extraída 100% pasivamente del JS de la página (el mismo texto que ya se descarga para buscar secretos): rutas que el código conoce pero que nunca visitaste, buckets/hosts cloud, IPs internas, listeners de postMessage sin validar origen y WebSockets. Son hipótesis a validar, no hallazgos confirmados.</div>
+      <div id="jsrecon-list"></div>
     </section>
     <section id="tab-chains" class="tab-content">
       <div class="hint" style="margin-bottom:8px">Cruces automáticos entre pestañas (IDOR, Race Conditions, versiones de API, Entidades, Secretos, GraphQL, OAuth, CORS) cuando dos señales concretas coinciden en la misma sesión. Nunca ejecuta nada — son hipótesis para validar vos, no hallazgos confirmados.</div>

@@ -625,7 +625,7 @@ function clearPanelError() {
 }
 
 function emptyData(domain) {
-  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], securityHeaderFindings: [], oauthFlows: {}, oauthFindings: [], idorCandidates: [], raceCandidates: {}, apiVersionCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, entitySeenInResponse: {}, reflectedValues: {}, dismissedFindings: {}, secretStatus: {}, graphqlOperations: {}, graphqlIntrospection: [], techFingerprint: {}, sourceMaps: {} };
+  return { domain, endpoints: {}, params: {}, secrets: [], jwts: [], corsFindings: [], cspFindings: [], securityHeaderFindings: [], oauthFlows: {}, oauthFindings: [], idorCandidates: [], raceCandidates: {}, apiVersionCandidates: [], notes: [], entityGraph: { nodes: {}, edges: {} }, entitySeenInResponse: {}, reflectedValues: {}, dismissedFindings: {}, secretStatus: {}, graphqlOperations: {}, graphqlIntrospection: [], techFingerprint: {}, sourceMaps: {}, jsIntel: {} };
 }
 
 // ---- Severidad multi-plataforma: traducción de nuestra escala interna
@@ -772,6 +772,7 @@ function render() {
     renderCors();
     renderGraphQL();
     renderTech();
+    renderJsRecon();
     renderChains();
     renderNotes();
   } catch (err) {
@@ -816,6 +817,8 @@ function computeDomainPriorityScore(data) {
   score += Object.values(data.raceCandidates || {}).filter((c) => c.level === "HIGH").length * 8;
   score += (data.apiVersionCandidates || []).filter((c) => c.level === "HIGH").length * 8;
   score += (data.secrets || []).filter((s) => !dismissed[s.match + s.source]).length * 8;
+  score += Object.values((data.jsIntel || {}).postMessage || {}).filter((m) => m.level === "HIGH").length * 8;
+  score += Object.values((data.jsIntel || {}).cloud || {}).length * 2;
   score += computeSuggestedChains(data).length * 5;
   return score;
 }
@@ -2760,6 +2763,139 @@ function renderTech() {
       renderTech();
     });
   });
+}
+
+
+// ---- JS Recon (v0.37) ------------------------------------------------------
+function normalizeForCompare(path) {
+  return String(path || "")
+    .split("?")[0]
+    .split("/")
+    .map((seg) => (/^\d+$/.test(seg) || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg) || /[{}$:]/.test(seg) ? "{id}" : seg))
+    .join("/")
+    .replace(/\/+$/, "");
+}
+
+function renderJsRecon() {
+  const el = document.getElementById("jsrecon-list");
+  if (!el) return;
+  const j = currentData.jsIntel || {};
+  const endpoints = Object.values(j.endpoints || {});
+  const cloud = Object.values(j.cloud || {});
+  const internal = Object.values(j.internal || {});
+  const hosts = Object.values(j.hosts || {});
+  const pms = Object.values(j.postMessage || {});
+  const wss = Object.values(j.websockets || {});
+  const params = j.params || [];
+
+  if (![endpoints, cloud, internal, hosts, pms, wss, params].some((a) => a.length)) {
+    el.innerHTML = `<div class="empty">Sin inteligencia de JS aún. Navegá el objetivo para que se analicen sus bundles.</div>`;
+    return;
+  }
+
+  // ¿Qué rutas del JS nunca se vieron en tráfico real?
+  const observed = new Set();
+  for (const ep of Object.values(currentData.endpoints || {})) {
+    try {
+      const u = new URL(ep.url);
+      observed.add(normalizeForCompare(u.pathname));
+      observed.add(normalizeForCompare(u.origin + u.pathname));
+    } catch {}
+  }
+  const rows = endpoints
+    .map((e) => {
+      const key = e.abs ? normalizeForCompare(e.origin + e.path) : normalizeForCompare(e.path);
+      return { ...e, unvisited: !observed.has(key) };
+    })
+    .sort((a, b) => Number(b.unvisited) - Number(a.unvisited) || Number(b.hint) - Number(a.hint) || a.path.localeCompare(b.path));
+  const unvisitedCount = rows.filter((r) => r.unvisited).length;
+  const MAX_ROWS = 150;
+  const fullUrl = (e) => (e.abs ? e.origin + e.path : (e.origin || `https://${currentData.domain}`) + e.path);
+
+  const section = (title, body) => `<div class="detail-block" style="margin-bottom:12px"><b>${title}</b>${body}</div>`;
+  const srcLine = (r) => `<div class="hint" style="margin-top:2px">${(r.sources || []).slice(0, 2).map((x) => escapeHtml(String(x).split("/").slice(-1)[0] || x)).join(" · ")}</div>`;
+
+  let html = "";
+
+  html += section(
+    `Rutas en el JS (${rows.length}, ${unvisitedCount} sin visitar)`,
+    `<div style="margin:6px 0"><button class="btn" id="jsrecon-copy-unvisited">Copiar URLs sin visitar</button>
+       <button class="btn" id="jsrecon-copy-params">Copiar ${params.length} parámetros (wordlist)</button></div>` +
+      (rows.length
+        ? rows.slice(0, MAX_ROWS).map((r) => `<div class="row" style="margin-top:4px">
+            <span class="badge ${r.unvisited ? (r.hint ? "high" : "medium") : "low"}">${r.unvisited ? "sin visitar" : "visto"}</span>
+            ${r.hint ? `<span class="badge medium">API</span>` : ""}
+            <span class="mono">${escapeHtml(r.abs ? r.origin + r.path : r.path)}</span>${srcLine(r)}</div>`).join("") +
+          (rows.length > MAX_ROWS ? `<div class="hint">+${rows.length - MAX_ROWS} más (usá "Copiar URLs sin visitar" para el listado completo)</div>` : "")
+        : `<div class="empty">Ninguna ruta extraída.</div>`)
+  );
+
+  if (cloud.length) {
+    html += section(
+      `Activos cloud / candidatos a takeover (${cloud.length})`,
+      cloud.map((c) => `<div class="row" style="margin-top:6px"><span class="badge medium">${escapeHtml(c.kind)}</span> <span class="mono">${escapeHtml(c.value)}</span>
+        <div class="hint" style="margin-top:2px">${escapeHtml(c.hint || "")}</div>${srcLine(c)}</div>`).join("")
+    );
+  }
+
+  if (hosts.length) {
+    html += section(
+      `Subdominios mencionados en el JS (${hosts.length})`,
+      hosts.sort((a, b) => Number(b.envLike) - Number(a.envLike)).map((h) => `<div class="row" style="margin-top:4px">
+        ${h.envLike ? `<span class="badge high">entorno no prod</span>` : `<span class="badge low">subdominio</span>`}
+        <span class="mono">${escapeHtml(h.host)}</span>${srcLine(h)}</div>`).join("")
+    );
+  }
+
+  if (internal.length) {
+    html += section(
+      `IPs/hosts internos filtrados (${internal.length})`,
+      internal.map((i) => `<div class="row" style="margin-top:4px"><span class="badge medium">interno</span> <span class="mono">${escapeHtml(i.value)}</span>${srcLine(i)}</div>`).join("")
+    );
+  }
+
+  if (pms.length) {
+    const lvl = { HIGH: "high", MED: "medium", LOW: "low" };
+    html += section(
+      `Listeners de postMessage (${pms.length})`,
+      `<div class="hint">CANDIDATE: se inspecciona el código del handler; no se envía ningún mensaje. HIGH = usa un sink peligroso sin ver chequeo de origin.</div>` +
+      pms.sort((a, b) => ({ HIGH: 0, MED: 1, LOW: 2 }[a.level] - { HIGH: 0, MED: 1, LOW: 2 }[b.level])).map((m) => `<div class="row" style="margin-top:6px">
+        <span class="badge ${lvl[m.level] || "low"}">${escapeHtml(m.level)}</span>
+        <b>${m.checksOrigin ? "valida origin" : "sin chequeo de origin visible"}</b>${m.sinks?.length ? ` · sinks: <span class="mono">${m.sinks.map(escapeHtml).join(", ")}</span>` : ""}
+        ${m.script ? `<div class="hint">script: ${escapeHtml(m.script)}</div>` : ""}
+        <pre class="mono" style="background:var(--bg2,#0b0f0d);padding:6px;max-height:140px;overflow:auto;white-space:pre-wrap">${escapeHtml(m.snippet || "")}</pre>
+        <div class="hint">Validación: desde una página que controlás, abrí el sitio con window.open y enviá un postMessage con el payload (solo en scope).</div></div>`).join("")
+    );
+  }
+
+  if (wss.length) {
+    html += section(
+      `WebSockets (${wss.length})`,
+      wss.map((w) => `<div class="row" style="margin-top:6px">
+        ${w.insecure ? `<span class="badge high">ws:// sin TLS</span>` : ""}${w.tokenInUrl ? `<span class="badge high">token en URL</span>` : ""}
+        <span class="mono">${escapeHtml(w.url)}</span>
+        ${w.script ? `<div class="hint">script: ${escapeHtml(w.script)}</div>` : ""}
+        ${(w.samples || []).map((s) => `<pre class="mono" style="max-height:80px;overflow:auto;white-space:pre-wrap">${escapeHtml(s)}</pre>`).join("")}
+        <div class="hint">Probar: autorización por mensaje (IDOR en IDs de canal/sala), Origin no validado (CSWSH) y suscripción sin sesión.</div></div>`).join("")
+    );
+  }
+
+  el.innerHTML = html;
+
+  const copy = async (text, btn) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      const prev = btn.textContent;
+      btn.textContent = "¡Copiado!";
+      setTimeout(() => { btn.textContent = prev; }, 1200);
+    } catch {
+      // el clipboard puede fallar sin permiso de foco; no rompe el resto del panel
+    }
+  };
+  const b1 = document.getElementById("jsrecon-copy-unvisited");
+  if (b1) b1.addEventListener("click", () => copy([...new Set(rows.filter((r) => r.unvisited).map(fullUrl))].join("\n"), b1));
+  const b2 = document.getElementById("jsrecon-copy-params");
+  if (b2) b2.addEventListener("click", () => copy(params.join("\n"), b2));
 }
 
 function renderGraphQL() {
