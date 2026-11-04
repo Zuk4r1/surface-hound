@@ -33,6 +33,7 @@ const expanded = { endpoints: new Set(), params: new Set(), jwt: new Set(), secr
 // pocos segundos, aunque el usuario no hubiera hecho nada -- el elemento
 // donde se mostraba siempre arrancaba vacío en cada render.
 const corsLiveResults = new Map(); // url -> { html: boolean, text: string }
+const apiVersionProbeResults = new Map();
 
 // El resultado normal/error se guarda como texto plano (nunca se confía
 // en que ${acao} -- el header devuelto por el SERVIDOR OBJETIVO, no
@@ -572,6 +573,7 @@ async function loadData() {
       for (const v of Object.values(expanded)) v.clear();
       for (const k of Object.keys(visibleCounts)) delete visibleCounts[k];
       corsLiveResults.clear();
+      apiVersionProbeResults.clear();
       lastLoadedDomain = currentDomain;
     }
     document.getElementById("domain-title").textContent = `Superficie de ataque — ${currentDomain}`;
@@ -1257,6 +1259,72 @@ async function activeCorsCheck(url) {
   }
 }
 
+function apiVersionProbeNumberCandidates(observedVersions) {
+  const majorOf = (label) => {
+    const match = String(label).match(/(\d{1,3})/);
+    return match ? Number(match[1]) : 0;
+  };
+  const seen = new Set(observedVersions.map(majorOf));
+  const majors = observedVersions.map(majorOf).filter((n) => n > 0);
+  const base = majors.length ? Math.min(...majors) : 1;
+  const out = [];
+  for (const n of [1, base - 1, base + 1, base - 2]) {
+    if (n >= 1 && !seen.has(n) && !out.includes(n)) out.push(n);
+    if (out.length === 3) break;
+  }
+  return out;
+}
+
+function buildApiVersionProbeCandidates(candidate) {
+  if (candidate.method !== "GET") return [];
+  const base = [...candidate.versions].sort((a, b) => b.hits - a.hits)[0];
+  if (!base?.rawToken || !base?.url) return [];
+  const numbers = apiVersionProbeNumberCandidates(candidate.versions.map((v) => v.version));
+
+  return numbers.map((number) => {
+    const url = new URL(base.url);
+    const replacement = base.rawToken.replace(/\d+(\.\d+)?/, String(number));
+    if (candidate.versionSource === "path") {
+      url.pathname = url.pathname.replace(/\/(v|ver|version)\d{1,3}(\.\d{1,3})?(?=[/?#]|$)/i, (token) => token.replace(/\d+(\.\d+)?/, String(number)));
+    } else if (candidate.versionSource === "host") {
+      const labels = url.hostname.split(".");
+      const index = labels.findIndex((label) => label.toLowerCase() === base.rawToken.toLowerCase());
+      if (index >= 0) {
+        labels[index] = replacement;
+        url.hostname = labels.join(".");
+      }
+    } else if (candidate.versionSource === "query" && base.versionParamName) {
+      url.searchParams.set(base.versionParamName, String(number));
+    } else {
+      return null;
+    }
+    for (const key of [...url.searchParams.keys()]) {
+      const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (/(password|passwd|secret|token|apikey|authorization|auth|session|signature|credential|privatekey|cookie|jwt)/.test(normalizedKey)) {
+        url.searchParams.delete(key);
+      }
+    }
+    return { version: `v${number}`, url: url.href };
+  }).filter(Boolean);
+}
+
+async function activeApiVersionProbe(url) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch(url, { method: "GET", credentials: "omit", redirect: "manual", signal: controller.signal });
+    if (res.type === "opaqueredirect") {
+      return { ok: false, error: "redirección no seguida para proteger el scope" };
+    }
+    return { ok: true, status: res.status };
+  } catch (error) {
+    if (error.name === "AbortError") return { ok: false, error: "timeout (10s)" };
+    return { ok: false, error: error.message || "falló la solicitud" };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // ---- Parámetros: clic para expandir payloads sugeridos ----
 
 function isReflectionConfirmed(param, sources) {
@@ -1625,30 +1693,48 @@ function renderRace() {
 
 // ---- Comparación de versiones de API ------------------------------------
 
+// Texto legible para versionSource -- de dónde salió el "{version}" del
+// template (ver buildApiVersionTemplate en background.js).
+function apiVersionSourceText(source) {
+  if (source === "host") return "subdominio (ej. api-v1.ejemplo.com)";
+  if (source === "query") return "query param (?version=.../?api_version=...)";
+  return "path (/v1/, /v2/...)";
+}
+
+function apiVersionRowSummary(v) {
+  const noAuthTxt = v.noAuthHits > 0 ? `sin auth: ${v.noAuthHits}x, último status ${v.lastNoAuthStatus ?? "?"}` : "sin auth: no observado";
+  const authTxt = v.authHits > 0 ? `con auth: ${v.authHits}x, último status ${v.lastAuthStatus ?? "?"}` : "con auth: no observado";
+  return `${noAuthTxt} · ${authTxt}`;
+}
+
 function buildApiVersionTestSpec(c) {
   const rows = c.versions
-    .map((v) => `  ${v.version.padEnd(8)} hasAuth observado: ${v.hasAuth ? "sí" : "no"} · último status: ${v.status ?? "?"} · hits: ${v.hits} · ${v.url}`)
+    .map((v) => `  ${v.version.padEnd(8)} ${apiVersionRowSummary(v)} · ${v.url}`)
     .join("\n");
   return [
     `Recurso (plantilla): ${c.method} ${c.template}`,
+    `Versionado detectado por: ${apiVersionSourceText(c.versionSource)}`,
     ``,
-    `Versiones vistas en tráfico real:`,
+    `Versiones vistas en tráfico real (status separado por si el request llevaba auth o no):`,
     rows,
     ``,
     `Señal observada:`,
     c.authDiffers
-      ? "Al menos una versión mostró auth (Authorization/Cookie) en el tráfico capturado y otra NO, para el mismo recurso."
-      : "Mismo recurso en 2+ versiones distintas vivas al mismo tiempo (sin diferencia de auth observada todavía).",
+      ? "Al menos una versión respondió 2xx a requests SIN auth, mientras otra solo respondió 2xx con auth presente -- para el mismo recurso."
+      : "Mismo recurso en 2+ versiones distintas vivas al mismo tiempo (sin diferencia de auth confirmada todavía).",
     c.openConfirmed
-      ? "Además, la versión sin auth observada devolvió un status 2xx -- indicio fuerte de acceso real sin autenticación, no solo falta de tráfico autenticado capturado."
-      : "Ojo: 'hasAuth: no' acá solo significa que todavía no se capturó un request autenticado a esa versión -- no confirma por sí solo que el endpoint no la exija.",
+      ? "Confirmado por status code real: la versión sin auth devolvió 2xx en requests SIN Authorization/Cookie -- no es solo falta de tráfico autenticado capturado, es un 2xx real sin credenciales."
+      : "Ojo: todavía no se capturó un request SIN auth que haya devuelto 2xx para la versión vieja -- no confirma por sí solo que el endpoint no exija auth.",
+    c.onlyDeadSuspicion
+      ? "⚠ La única señal de \"sin auth\" en la versión vieja es un status típico de ruta inexistente/dada de baja (404/405/410/501) -- probablemente NO es un problema de control de acceso, sino una versión decomisionada. Confianza bajada a propósito."
+      : "",
     ``,
     `Suggested test:`,
     `Repetir el mismo request a la versión más vieja SIN headers de sesión y comparar status + body contra la versión nueva (con y sin sesión).`,
     ``,
     `Qué falta demostrar:`,
     buildValidationChecklist("api_version_diff"),
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function buildApiVersionBurpRequests(c) {
@@ -1656,10 +1742,10 @@ function buildApiVersionBurpRequests(c) {
     let url;
     try { url = new URL(v.url); } catch { return `${v.method} ${v.url} HTTP/1.1`; }
     const lines = [
-      `### ${v.version} (hasAuth observado: ${v.hasAuth ? "sí" : "no"}, último status: ${v.status ?? "?"})`,
+      `### ${v.version} (${apiVersionRowSummary(v)})`,
       `${v.method} ${url.pathname}${url.search} HTTP/1.1`,
       `Host: ${url.host}`,
-      v.hasAuth ? "Cookie: <tu sesión actual>" : "# (probar primero SIN Cookie/Authorization -- es lo que se observó pasivamente)",
+      v.authHits > 0 ? "Cookie: <tu sesión actual>" : "# (probar primero SIN Cookie/Authorization -- es lo que se observó pasivamente)",
       "",
     ];
     return lines.join("\n");
@@ -1670,36 +1756,66 @@ function apiVersionCandidatesSorted() {
   return [...(currentData.apiVersionCandidates || [])].sort((a, b) => b.confidence - a.confidence);
 }
 
+function renderApiVersionProbeResult(groupKey) {
+  const results = apiVersionProbeResults.get(groupKey);
+  if (!results) return "";
+  return results.map((result) => {
+    if (result.pending) return `<div class="hint mono">${escapeHtml(result.version)}: probando…</div>`;
+    if (!result.ok) return `<div class="hint mono">${escapeHtml(result.version)}: ${escapeHtml(result.error)}</div>`;
+    const successful = result.status >= 200 && result.status < 300;
+    const badge = successful
+      ? '<span class="badge critical">respondió</span>'
+      : result.status === 404 || result.status === 410
+        ? '<span class="badge info">no existe</span>'
+        : '<span class="badge medium">respondió</span>';
+    return `<div class="hint mono">${escapeHtml(result.version)}: HTTP ${result.status} ${badge} · <a href="${escapeHtml(result.url)}" target="_blank" rel="noopener">${escapeHtml(result.url)}</a></div>`;
+  }).join("");
+}
+
 function renderApiVersions() {
   const el = document.getElementById("apiversions-list");
   if (!el) return;
   const entries = apiVersionCandidatesSorted();
   if (!entries.length) {
-    el.innerHTML = `<div class="empty">Sin candidatos todavía. Hace falta haber visto en tráfico real al menos 2 versiones distintas del mismo recurso (ej. /api/v1/users/{id} y /api/v2/users/{id}) -- si el sitio solo usa una versión en el path, o versiona por header/subdominio, acá no va a aparecer nada.</div>`;
+    el.innerHTML = `<div class="empty">Sin candidatos todavía. Hace falta haber visto en tráfico real al menos una versión identificable del mismo recurso -- por path (/api/v1/users/{id}), por subdominio (api-v1.ejemplo.com) o por query param explícito (?version=1). Si el sitio no versiona en esos formatos, o versiona por HEADER (Accept-Version, content negotiation), acá no va a aparecer nada -- eso no está cubierto.</div>`;
     return;
   }
   el.innerHTML = entries.map((c, i) => {
     const isOpen = expanded.apiVersions.has(c.groupKey);
-    const versionRows = c.versions.map((v) => `<tr>
+    const versionRows = c.versions.map((v) => {
+      const openHere = v.noAuthHits > 0 && v.lastNoAuthStatus >= 200 && v.lastNoAuthStatus < 300;
+      return `<tr>
       <td class="mono" style="padding:3px 8px 3px 0">${escapeHtml(v.version)}</td>
-      <td style="padding:3px 8px">${v.hasAuth ? '<span class="badge medium">sí</span>' : '<span class="badge info">no observado</span>'}</td>
-      <td class="mono" style="padding:3px 8px">${v.status ?? "?"}</td>
+      <td style="padding:3px 8px">${v.noAuthHits > 0 ? `${openHere ? '<span class="badge critical">' : '<span class="badge info">'}${v.noAuthHits}x · ${v.lastNoAuthStatus ?? "?"}</span>` : '<span class="badge info">no observado</span>'}</td>
+      <td style="padding:3px 8px">${v.authHits > 0 ? `<span class="badge medium">${v.authHits}x · ${v.lastAuthStatus ?? "?"}</span>` : '<span class="badge info">no observado</span>'}</td>
       <td style="padding:3px 8px">${v.hits}</td>
-    </tr>`).join("");
+    </tr>`;
+    }).join("");
+    const probeCandidates = buildApiVersionProbeCandidates(c);
+    const probeResults = apiVersionProbeResults.get(c.groupKey) || [];
+    const probeRunning = probeResults.some((result) => result.pending);
+    const probeDisabled = currentMode === "passive" || probeRunning || probeCandidates.length === 0;
+    const probeTitle = currentMode === "passive"
+      ? "Cambia a modo Asistido o Activo"
+      : probeCandidates.length === 0
+        ? "No hay versiones vecinas para probar, o el método no es GET"
+        : probeRunning ? "Sonda en curso" : "";
     return `<div class="row">
       <div class="row-head" style="display:flex;justify-content:space-between;align-items:center">
         <span class="title mono">🔀 ${escapeHtml(c.method)} ${escapeHtml(c.template)}</span>
         ${levelBadge(c.level)}
       </div>
-      <div class="hint" style="margin-top:4px"><b>Confidence:</b> ${c.confidence}% · <b>CWE:</b> CWE-284 · OWASP API9:2023</div>
-      <div class="hint" style="margin-top:4px">${c.versions.length} versiones vistas${c.authDiffers ? " · <b>hasAuth difiere entre versiones</b>" : ""}${c.openConfirmed ? " · <b>versión sin auth respondió 2xx</b>" : ""}</div>
+      <div class="hint" style="margin-top:4px"><b>Confidence:</b> ${c.confidence}% · <b>CWE:</b> CWE-284 · OWASP API9:2023 · <b>detectado por:</b> ${escapeHtml(apiVersionSourceText(c.versionSource))}</div>
+      <div class="hint" style="margin-top:4px">${c.singleVersionObserved ? "1 sola versión vista en tráfico real -- probá versiones candidatas para buscar otras que el tráfico normal nunca pisó" : `${c.versions.length} versiones vistas${c.authDiffers ? " · <b>confirmado: una versión abierta sin auth, otra solo con auth</b>" : ""}${c.onlyDeadSuspicion ? ' · <span class="badge info">posible versión dada de baja (no bug)</span>' : ""}`}</div>
       <table class="mono" style="width:100%;margin-top:6px;font-size:12px;border-collapse:collapse">
-        <thead><tr><th style="text-align:left;padding:3px 8px 3px 0">Versión</th><th style="text-align:left;padding:3px 8px">hasAuth</th><th style="text-align:left;padding:3px 8px">Status</th><th style="text-align:left;padding:3px 8px">Hits</th></tr></thead>
+        <thead><tr><th style="text-align:left;padding:3px 8px 3px 0">Versión</th><th style="text-align:left;padding:3px 8px">Sin auth (hits · status)</th><th style="text-align:left;padding:3px 8px">Con auth (hits · status)</th><th style="text-align:left;padding:3px 8px">Hits totales</th></tr></thead>
         <tbody>${versionRows}</tbody>
       </table>
       <div class="detail-actions" style="margin-top:8px">
         <button class="btn-prepare-apiv-test" data-idx="${i}">${isOpen ? "Ocultar validación sugerida" : "Ver validación sugerida"}</button>
+        <button class="btn-probe-apiv" data-idx="${i}" ${probeDisabled ? `disabled title="${escapeHtml(probeTitle)}"` : ""}>Probar versiones candidatas (${probeCandidates.map((probe) => probe.version).join(", ") || "ninguna"})</button>
       </div>
+      <div class="apiv-probe-result" style="margin-top:4px">${renderApiVersionProbeResult(c.groupKey)}</div>
       ${isOpen ? `<div class="detail">
         <div class="hint" style="margin-bottom:4px"><b>Suggested validation</b></div>
         <pre class="mono" data-scroll-key="apiv-spec-${escapeHtml(c.groupKey)}" style="background:var(--bg);padding:8px;border-radius:4px;overflow-x:auto">${escapeHtml(buildApiVersionTestSpec(c))}</pre>
@@ -1750,6 +1866,33 @@ function renderApiVersions() {
       document.querySelector(".tab-btn[data-tab='notes']").classList.add("active");
       document.getElementById("tab-notes").classList.add("active");
       render();
+    });
+  });
+  el.querySelectorAll(".btn-probe-apiv").forEach((btn) => {
+    btn.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const candidate = entries[Number(btn.dataset.idx)];
+      const probes = buildApiVersionProbeCandidates(candidate);
+      if (currentMode === "passive" || probes.length === 0) return;
+
+      const probeDomain = currentDomain;
+      apiVersionProbeResults.set(candidate.groupKey, probes.map((probe) => ({ version: probe.version, pending: true })));
+      renderApiVersions();
+
+      await Promise.all(probes.map(async (probe) => {
+        const blocked = checkActiveActionAllowed(probe.url);
+        const result = blocked
+          ? { ok: false, error: blocked.replace(/\n+/g, " ") }
+          : await activeApiVersionProbe(probe.url);
+        if (currentDomain !== probeDomain) return;
+        const results = apiVersionProbeResults.get(candidate.groupKey) || [];
+        apiVersionProbeResults.set(candidate.groupKey, results.map((item) => (
+          item.version === probe.version
+            ? { version: probe.version, url: probe.url, ...result }
+            : item
+        )));
+        renderApiVersions();
+      }));
     });
   });
 }

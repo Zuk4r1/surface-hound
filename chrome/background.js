@@ -742,15 +742,87 @@ function buildAllIdorCandidates(urlHistory, data) {
 }
 
 // ---- Comparación pasiva de versiones de API ----------------------------
+//
+// v2: antes solo detectaba versionado por PATH (/v1/, /v2/...). Ahora
+// también cubre versionado por SUBDOMINIO (api-v1.ejemplo.com,
+// v2.api.ejemplo.com) y por QUERY PARAM explícito (?version=2,
+// ?api_version=1 -- deliberadamente SIN "v"/"ver" sueltos como nombre de
+// parámetro: son demasiado comunes para otros usos -- cache-busting,
+// variantes, tamaño de página -- y generarían falsos positivos reales).
+//
+// También se corrigió un bug de precisión: antes "hasAuth"/"status" eran
+// un único valor por endpoint que se pisaba con el ÚLTIMO request visto,
+// sin importar si ESE request en particular llevaba auth -- un endpoint
+// que recibió una request autenticada (200) y después una sin autenticar
+// (401) terminaba con status=401 aunque el 200 sí haya pasado. Ahora se
+// usan noAuthHits/lastNoAuthStatus/authHits/lastAuthStatus, llenados por
+// request real correlacionado por requestId (ver authStateByRequestId) --
+// "openConfirmed" refleja específicamente el status de los intentos SIN
+// auth, no el último status visto sea cual sea su origen.
 const VERSION_SEGMENT_RE = /\/(v|ver|version)(\d{1,3})(\.\d{1,3})?(?=[/?#]|$)/i;
+// Label de host tipo "api-v1", "v2-api", "v1", "apiv3" -- bastante
+// distintivo; un subdominio real rara vez tiene esta forma exacta por
+// otro motivo, así que el riesgo de falso positivo acá es bajo.
+const HOST_VERSION_LABEL_RE = /^(api-?)?v(\d{1,3})(\.\d{1,3})?(-?api)?$/i;
+const QUERY_VERSION_PARAM_NAMES = new Set(["version", "api_version", "apiversion", "api-version"]);
+const QUERY_VERSION_VALUE_RE = /^\d{1,3}(\.\d{1,3})?$/;
+// Status que indican "esta ruta ya no existe o no aplica", no un problema
+// de control de acceso -- si la versión "sin auth" solo muestra esto, es
+// más probable una versión dada de baja que una vulnerabilidad real.
+const API_VERSION_DEAD_STATUSES = new Set([404, 405, 410, 501]);
 
-function buildApiVersionTemplate(pathOnly) {
-  const match = pathOnly.match(VERSION_SEGMENT_RE);
-  if (!match) return null;
-  return {
-    template: pathOnly.replace(VERSION_SEGMENT_RE, "/{version}").replace(ID_SEGMENT_RE, "/{id}"),
-    version: match[0].slice(1).toLowerCase(),
-  };
+function detectHostVersion(host) {
+  const labels = host.split(".");
+  for (let i = 0; i < labels.length; i++) {
+    const m = labels[i].match(HOST_VERSION_LABEL_RE);
+    if (m) {
+      const templated = labels.slice();
+      templated[i] = "{version}";
+      return { version: `v${m[2]}${m[3] || ""}`.toLowerCase(), templatedHost: templated.join("."), rawToken: labels[i] };
+    }
+  }
+  return null;
+}
+
+function detectQueryVersion(urlObj) {
+  for (const [key, value] of urlObj.searchParams.entries()) {
+    if (QUERY_VERSION_PARAM_NAMES.has(key.toLowerCase()) && QUERY_VERSION_VALUE_RE.test(value)) {
+      return { version: value.toLowerCase(), paramName: key.toLowerCase(), rawParamName: key, rawToken: value };
+    }
+  }
+  return null;
+}
+
+function endpointKeyForUrl(url, method) {
+  const normalizedMethod = (method || "GET").toUpperCase();
+  const baseUrl = url.split("?")[0];
+  try {
+    const queryVersion = detectQueryVersion(new URL(url));
+    if (queryVersion) return `${normalizedMethod} ${baseUrl}?${queryVersion.paramName}=${queryVersion.version}`;
+  } catch {}
+  return `${normalizedMethod} ${baseUrl}`;
+}
+
+// Prueba las 3 estrategias en orden de confiabilidad: path (la más común
+// y menos ambigua) > host (bastante distintivo) > query param (la más
+// ruidosa, por eso el whitelist estricto de nombres).
+function buildApiVersionTemplate(urlObj) {
+  const pathMatch = urlObj.pathname.match(VERSION_SEGMENT_RE);
+  if (pathMatch) {
+    const templatedPath = urlObj.pathname.replace(VERSION_SEGMENT_RE, "/{version}").replace(ID_SEGMENT_RE, "/{id}");
+    return { version: pathMatch[0].slice(1).toLowerCase(), versionSource: "path", groupTemplate: `${urlObj.host}${templatedPath}`, rawToken: pathMatch[0] };
+  }
+  const hostVersion = detectHostVersion(urlObj.host);
+  if (hostVersion) {
+    const templatedPath = urlObj.pathname.replace(ID_SEGMENT_RE, "/{id}");
+    return { version: hostVersion.version, versionSource: "host", groupTemplate: `${hostVersion.templatedHost}${templatedPath}`, rawToken: hostVersion.rawToken };
+  }
+  const queryVersion = detectQueryVersion(urlObj);
+  if (queryVersion) {
+    const templatedPath = urlObj.pathname.replace(ID_SEGMENT_RE, "/{id}");
+    return { version: queryVersion.version, versionSource: "query", groupTemplate: `${urlObj.host}${templatedPath}?{${queryVersion.paramName}}`, rawToken: queryVersion.rawToken, paramName: queryVersion.rawParamName };
+  }
+  return null;
 }
 
 function apiVersionSortKey(label) {
@@ -763,26 +835,56 @@ function scoreApiVersionCandidate(groupKey, versionsMap) {
     const ka = apiVersionSortKey(a.version), kb = apiVersionSortKey(b.version);
     return ka[0] - kb[0] || ka[1] - kb[1];
   });
-  const hasAuthVersions = versions.filter((v) => v.hasAuth);
-  const noAuthVersions = versions.filter((v) => !v.hasAuth);
-  const authDiffers = hasAuthVersions.length > 0 && noAuthVersions.length > 0;
-  const openConfirmed = noAuthVersions.some((v) => typeof v.status === "number" && v.status >= 200 && v.status < 300);
-  const openHitsOk = noAuthVersions.some((v) => v.hits >= 2);
+  if (versions.length === 1) {
+    return {
+      groupKey,
+      method: versions[0].method,
+      template: groupKey.split(" ").slice(1).join(" "),
+      versionSource: versions[0].versionSource,
+      versions,
+      authDiffers: false,
+      openConfirmed: false,
+      onlyDeadSuspicion: false,
+      singleVersionObserved: true,
+      confidence: 12,
+      level: "LOW",
+    };
+  }
+  const isOpen = (v) => v.noAuthHits > 0 && v.lastNoAuthStatus >= 200 && v.lastNoAuthStatus < 300;
+  const isProtected = (v) => v.authHits > 0
+    && v.lastAuthStatus >= 200 && v.lastAuthStatus < 300
+    && (v.noAuthHits === 0 || !isOpen(v));
+  const isDeadNoAuth = (v) => v.noAuthHits > 0 && v.authHits === 0 && API_VERSION_DEAD_STATUSES.has(v.lastNoAuthStatus);
 
-  let confidence = 20;
+  const openVersions = versions.filter(isOpen);
+  const protectedVersions = versions.filter(isProtected);
+  const deadNoAuthVersions = versions.filter(isDeadNoAuth);
+
+  const authDiffers = openVersions.length > 0 && protectedVersions.length > 0;
+  const openConfirmed = openVersions.length > 0;
+  const openHitsOk = openVersions.some((v) => v.noAuthHits >= 2);
+  // La única sospecha es una versión "muerta" (404/405/410/501) sin auth,
+  // sin ninguna versión realmente abierta -- probable baja, no bug.
+  const onlyDeadSuspicion = !openConfirmed && deadNoAuthVersions.length > 0 && protectedVersions.length > 0;
+
+  let confidence = 18;
   if (authDiffers) confidence += 25;
   if (openConfirmed) confidence += 30;
   if (openHitsOk) confidence += 10;
   if (versions.length >= 3) confidence += 5;
-  confidence = Math.min(96, confidence);
+  if (onlyDeadSuspicion) confidence -= 20;
+  confidence = Math.max(5, Math.min(96, confidence));
 
   return {
     groupKey,
     method: versions[0].method,
     template: groupKey.split(" ").slice(1).join(" "),
+    versionSource: versions[0].versionSource,
     versions,
     authDiffers,
     openConfirmed,
+    onlyDeadSuspicion,
+    singleVersionObserved: false,
     confidence,
     level: confidence >= 65 ? "HIGH" : confidence >= 40 ? "MED" : "LOW",
   };
@@ -792,28 +894,26 @@ function buildApiVersionCandidates(data) {
   const groups = new Map();
   for (const endpoint of Object.values(data.endpoints || {})) {
     if (!endpoint.url) continue;
-    let pathname, host;
-    try {
-      const url = new URL(endpoint.url);
-      pathname = url.pathname;
-      host = url.host;
-    } catch {
-      pathname = endpoint.url.split("?")[0];
-      host = "";
-    }
-    const versioned = buildApiVersionTemplate(pathname);
+    let urlObj;
+    try { urlObj = new URL(endpoint.url); } catch { continue; }
+    const versioned = buildApiVersionTemplate(urlObj);
     if (!versioned) continue;
 
     const method = (endpoint.method || "GET").toUpperCase();
-    const groupKey = `${method} ${host}${versioned.template}`;
+    const groupKey = `${method} ${versioned.groupTemplate}`;
     if (!groups.has(groupKey)) groups.set(groupKey, new Map());
     const versions = groups.get(groupKey);
     const candidate = {
       version: versioned.version,
+      versionSource: versioned.versionSource,
+      rawToken: versioned.rawToken,
+      versionParamName: versioned.paramName || null,
       url: endpoint.url,
       method,
-      hasAuth: !!endpoint.hasAuth,
-      status: endpoint.status,
+      noAuthHits: endpoint.noAuthHits || 0,
+      lastNoAuthStatus: endpoint.lastNoAuthStatus,
+      authHits: endpoint.authHits || 0,
+      lastAuthStatus: endpoint.lastAuthStatus,
       hits: endpoint.hits || 0,
       lastSeen: endpoint.lastSeen,
     };
@@ -822,7 +922,6 @@ function buildApiVersionCandidates(data) {
   }
 
   return Array.from(groups.entries())
-    .filter(([, versions]) => versions.size >= 2)
     .map(([groupKey, versions]) => scoreApiVersionCandidate(groupKey, versions))
     .sort((a, b) => b.confidence - a.confidence);
 }
@@ -1998,7 +2097,7 @@ async function upsertEndpoint(domain, url, method) {
   const scope = await getScopeConfig();
   return withDomainLock(domain, async () => {
     const data = await getDomainData(domain);
-    const key = `${method} ${url.split("?")[0]}`;
+    const key = endpointKeyForUrl(url, method);
     const now = Date.now();
     const inScope = isInScope(realHostname(url) || domain, scope);
     if (!data.endpoints[key]) {
@@ -2082,22 +2181,45 @@ ext.webRequest.onBeforeRequest.addListener(
 // Cookie en requests cross-origin. Firefox (>=72) también lo soporta.
 const EXTRA_HEADERS = ["extraHeaders"];
 
+// Correlación onSendHeaders -> onHeadersReceived por requestId (webRequest
+// da el MISMO requestId en todos los eventos del ciclo de vida de una
+// request real, en Chrome y en Firefox). Esto es lo que permite saber,
+// para CADA request individual, si llevaba auth o no en el momento exacto
+// en que se recibió su status code -- antes, "hasAuth"/"status" eran un
+// único valor por endpoint que se pisaba con el último request visto, sin
+// importar si ESE request en particular llevaba auth (ver comparación de
+// versiones de API más abajo, que es el consumidor principal de esto).
+// Efímero y acotado: se poda por antigüedad en cada inserción, y se borra
+// la entrada al consumirla en onHeadersReceived -- si una request se
+// aborta y nunca dispara onHeadersReceived, la entrada igual se poda sola.
+const authStateByRequestId = new Map();
+const AUTH_STATE_MAX_AGE_MS = 20000;
+function recordAuthState(requestId, hasAuth) {
+  const now = Date.now();
+  for (const [id, v] of authStateByRequestId.entries()) {
+    if (now - v.ts > AUTH_STATE_MAX_AGE_MS) authStateByRequestId.delete(id);
+  }
+  authStateByRequestId.set(requestId, { hasAuth, ts: now });
+}
+
 ext.webRequest.onSendHeaders.addListener(
   (details) => {
     const domain = extractDomain(details.url);
     if (!domain) return;
+    const headers = headersToObject(details.requestHeaders);
+    const authHeader = headers["authorization"] || "";
+    const cookieHeader = headers["cookie"] || "";
+    const hasAuth = !!(authHeader || cookieHeader);
+    recordAuthState(details.requestId, hasAuth);
+
     withDomainLock(domain, async () => {
-      const headers = headersToObject(details.requestHeaders);
-      const authHeader = headers["authorization"] || "";
-      const cookieHeader = headers["cookie"] || "";
-      const hasAuth = !!(authHeader || cookieHeader);
       const jwts = findJwtsInText(authHeader + " " + cookieHeader);
 
       if (!jwts.length && !hasAuth) return;
       const data = await getDomainData(domain);
 
       if (hasAuth) {
-        const epKey = `${details.method} ${details.url.split("?")[0]}`;
+        const epKey = endpointKeyForUrl(details.url, details.method);
         if (!data.endpoints[epKey]) {
           // Condición de carrera real con onBeforeRequest: aunque Chrome
           // dispara onBeforeRequest primero, upsertEndpoint hace un await
@@ -2152,6 +2274,11 @@ ext.webRequest.onHeadersReceived.addListener(
   (details) => {
     const domain = extractDomain(details.url);
     if (!domain) return;
+    // Se consume (y se borra) ACÁ, fuera del lock -- el Map es un recurso
+    // aparte de domainData, no necesita el lock del dominio, y conviene
+    // leerlo antes de que cualquier await mueva el reloj.
+    const authState = authStateByRequestId.get(details.requestId);
+    if (authState) authStateByRequestId.delete(details.requestId);
     withDomainLock(domain, async () => {
       const headers = headersToObject(details.responseHeaders);
       const contentType = headers["content-type"] || "";
@@ -2178,7 +2305,13 @@ ext.webRequest.onHeadersReceived.addListener(
       // rastreo de "alguna vez vimos un 429 en este endpoint" vive acá, no
       // en el otro listener, que se pierde requests de navegación/formularios.
       const is429 = details.statusCode === 429;
-      if (!corsFindings.length && !cspFindings.length && !securityHeaderFindings.length && !techFindings.length && !is429) return;
+      // authState viene de onSendHeaders para ESTE request puntual (ver
+      // authStateByRequestId) -- es lo que permite saber si el status
+      // code de ESTA respuesta corresponde a un intento con o sin auth,
+      // en vez de pisar un único "status" por endpoint sin importar de
+      // qué request vino. Alimenta específicamente la comparación de
+      // versiones de API (ver buildApiVersionCandidates).
+      if (!corsFindings.length && !cspFindings.length && !securityHeaderFindings.length && !techFindings.length && !is429 && !authState) return;
       const data = await getDomainData(domain);
       if (!data.securityHeaderFindings) data.securityHeaderFindings = [];
       for (const f of corsFindings) if (!data.corsFindings.some((x) => x.msg === f.msg)) data.corsFindings.push({ ...f, url: details.url });
@@ -2186,7 +2319,7 @@ ext.webRequest.onHeadersReceived.addListener(
       for (const f of securityHeaderFindings) if (!data.securityHeaderFindings.some((x) => x.msg === f.msg)) data.securityHeaderFindings.push({ ...f, url: details.url });
       recordTechFindings(data, techFindings);
       if (is429) {
-        const epKey = `${(details.method || "GET").toUpperCase()} ${details.url.split("?")[0]}`;
+        const epKey = endpointKeyForUrl(details.url, details.method);
         if (!data.endpoints[epKey]) {
           // Mismo problema que hasAuth tenía antes de corregirse: onHeadersReceived
           // puede llegar al lock del dominio antes de que onBeforeRequest haya
@@ -2204,6 +2337,30 @@ ext.webRequest.onHeadersReceived.addListener(
           };
         }
         data.endpoints[epKey].saw429 = true;
+      }
+      if (authState) {
+        const epKey = endpointKeyForUrl(details.url, details.method);
+        if (!data.endpoints[epKey]) {
+          // Mismo motivo que los otros dos stubs de esta misma carrera
+          // (hasAuth/saw429 arriba): sin esto, este status se pierde en
+          // silencio si onHeadersReceived llega antes de que
+          // upsertEndpoint haya terminado de crear el endpoint.
+          const scope = await getScopeConfig();
+          data.endpoints[epKey] = {
+            url: details.url, method: (details.method || "GET").toUpperCase(),
+            firstSeen: Date.now(), lastSeen: Date.now(), hits: 0,
+            inScope: isInScope(realHostname(details.url) || domain, scope),
+          };
+        }
+        const ep = data.endpoints[epKey];
+        if (authState.hasAuth) {
+          ep.authHits = (ep.authHits || 0) + 1;
+          ep.lastAuthStatus = details.statusCode;
+        } else {
+          ep.noAuthHits = (ep.noAuthHits || 0) + 1;
+          ep.lastNoAuthStatus = details.statusCode;
+        }
+        data.apiVersionCandidates = buildApiVersionCandidates(data);
       }
       await saveDomainData(domain, data);
     });
@@ -2282,9 +2439,8 @@ async function handleNetEvent(msg) {
     const data = await getDomainData(domain);
     ensureEntityGraph(data);
 
-    const path = (msg.url || "").split("?")[0];
     const method = (msg.method || "GET").toUpperCase();
-    const epKey = `${method} ${path}`;
+    const epKey = endpointKeyForUrl(msg.url || "", method);
     if (!data.endpoints[epKey]) {
       data.endpoints[epKey] = { url: msg.url, method, firstSeen: Date.now(), lastSeen: Date.now(), hits: 0, inScope: isInScope(realHostname(msg.url) || domain, scope) };
     }

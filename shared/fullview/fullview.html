@@ -81,7 +81,7 @@
       <div id="race-list"></div>
     </section>
     <section id="tab-apiversions" class="tab-content">
-      <div class="hint" style="margin-bottom:8px">Correlación pasiva: agrupa endpoints por "mismo recurso, mismo método, distinta versión en el path" (ej. /api/v1/users/{id} vs /api/v2/users/{id}) y compara si una versión mostró auth (Authorization/Cookie) en el tráfico capturado y otra no, o si una versión sin auth observada igual devolvió 2xx. Solo detecta versionado POR PATH -- no cubre versionado por header (Accept-Version) ni por subdominio (api-v1.ejemplo.com), y solo aparece algo acá si ya navegaste/usaste ambas versiones (no inventa tráfico a versiones viejas).</div>
+      <div class="hint" style="margin-bottom:8px">Agrupa endpoints por "mismo recurso, mismo método, distinta versión" -- detectada por PATH (/api/v1/... vs /api/v2/...), por SUBDOMINIO (api-v1.ejemplo.com vs api-v2...) o por QUERY PARAM explícito (?version=1, ?api_version=2). Con una sola versión vista aparece una tarjeta para sondear versiones vecinas: el botón solo funciona en modo Asistido/Activo y dentro del scope; envía hasta tres GET, omite credenciales del navegador y parámetros de query que parezcan secretos, no prueba métodos de escritura y no sigue redirecciones. La sonda es manual y su resultado temporal no se persiste. Para las versiones observadas, compara status de requests CON y SIN auth por separado; 404/405/410/501 sin auth puede indicar versión dada de baja. No cubre versionado por header (Accept-Version/content negotiation).</div>
       <div id="apiversions-list"></div>
     </section>
     <section id="tab-entidades" class="tab-content">
