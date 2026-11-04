@@ -111,10 +111,13 @@ def scope_match(hostname, pattern):
     hostname = hostname.lower()
     if not pattern:
         return False
-    if pattern.startswith("*."):
-        bare = pattern[2:]
-        return hostname == bare or hostname.endswith("." + bare)
-    return hostname == pattern
+    # Misma semántica que scopeMatch() en la extensión (background.js): un
+    # dominio "pelado" cubre el dominio Y sus subdominios; "*." es sinónimo.
+    # Antes el host exigía "*." explícito, así que la UI mostraba un target
+    # como en scope y el agente lo bloqueaba igual (www.dominio.com con
+    # allow=["dominio.com"]).
+    bare = pattern[2:] if pattern.startswith("*.") else pattern
+    return hostname == bare or hostname.endswith("." + bare)
 
 
 def is_in_scope(hostname, scope):
