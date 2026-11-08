@@ -2426,12 +2426,12 @@ ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ---- JS Recon (v0.37): datos extraídos de bundles, postMessage y WebSocket ----
 // Todo es observación pasiva; los topes evitan que un sitio con bundles
 // enormes infle chrome.storage.local.
-const JSINTEL_CAPS = { endpoints: 800, cloud: 200, internal: 80, hosts: 200, params: 400, postMessage: 40, websockets: 30 };
+const JSINTEL_CAPS = { endpoints: 800, cloud: 200, internal: 80, hosts: 200, params: 400, postMessage: 40, websockets: 30, routes: 400, graphql: 300, external: 300, emails: 100, config: 200, comments: 100, scripts: 300 };
 
 function ensureJsIntel(data) {
   if (!data.jsIntel || typeof data.jsIntel !== "object" || Array.isArray(data.jsIntel)) data.jsIntel = {};
   const j = data.jsIntel;
-  for (const k of ["endpoints", "cloud", "internal", "hosts", "postMessage", "websockets"]) {
+  for (const k of ["endpoints", "cloud", "internal", "hosts", "postMessage", "websockets", "routes", "graphql", "external", "emails", "config", "comments", "scripts"]) {
     if (!j[k] || typeof j[k] !== "object" || Array.isArray(j[k])) j[k] = {};
   }
   if (!Array.isArray(j.params)) j.params = [];
@@ -2463,7 +2463,50 @@ function recordJsIntel(data, intel, pageUrl) {
   for (const e of Array.isArray(intel.endpoints) ? intel.endpoints : []) {
     if (!e || typeof e.path !== "string") continue;
     const key = (e.abs ? "abs:" + String(e.origin || "") : "rel:") + e.path.split("?")[0].slice(0, 200);
-    putMap("endpoints", key, { path: e.path.slice(0, 200), origin: String(e.origin || "").slice(0, 120), abs: !!e.abs, hint: !!e.hint }, e.sources);
+    putMap("endpoints", key, { path: e.path.slice(0, 200), origin: String(e.origin || "").slice(0, 120), abs: !!e.abs, hint: !!e.hint, methods: [], bodyKeys: [], dynamic: false }, e.sources);
+    const rec = j.endpoints[key];
+    if (rec) {
+      rec.methods = Array.isArray(rec.methods) ? rec.methods : [];
+      rec.bodyKeys = Array.isArray(rec.bodyKeys) ? rec.bodyKeys : [];
+      for (const mth of Array.isArray(e.methods) ? e.methods : []) {
+        if (typeof mth === "string" && /^[A-Z]{3,7}$/.test(mth) && rec.methods.length < 5 && !rec.methods.includes(mth)) rec.methods.push(mth);
+      }
+      for (const k of Array.isArray(e.bodyKeys) ? e.bodyKeys : []) {
+        if (typeof k === "string" && k.length <= 41 && rec.bodyKeys.length < 20 && !rec.bodyKeys.includes(k)) rec.bodyKeys.push(k);
+      }
+      if (e.dynamic) rec.dynamic = true;
+      rec.contexts = Array.isArray(rec.contexts) ? rec.contexts : [];
+      for (const c of Array.isArray(e.contexts) ? e.contexts : []) {
+        if (c && typeof c.snippet === "string" && rec.contexts.length < 3 && !rec.contexts.some((x) => x.source === c.source)) {
+          rec.contexts.push({ source: String(c.source || "").slice(0, 400), snippet: c.snippet.slice(0, 260) });
+        }
+      }
+    }
+  }
+  for (const r of Array.isArray(intel.routes) ? intel.routes : []) {
+    if (r && typeof r.path === "string") putMap("routes", r.path.slice(0, 160), { path: r.path.slice(0, 160) }, r.sources);
+  }
+  for (const g of Array.isArray(intel.graphql) ? intel.graphql : []) {
+    if (g && typeof g.name === "string") putMap("graphql", String(g.kind).slice(0, 12) + " " + g.name.slice(0, 80), { kind: String(g.kind).slice(0, 12), name: g.name.slice(0, 80), snippet: String(g.snippet || "").slice(0, 200) }, g.sources);
+  }
+  for (const x of Array.isArray(intel.external) ? intel.external : []) {
+    if (x && typeof x.host === "string") {
+      putMap("external", x.host.slice(0, 200), { host: x.host.slice(0, 200), count: 0 }, x.sources);
+      const rec = j.external[x.host.slice(0, 200)];
+      if (rec) rec.count = Math.min(99999, Math.max(Number(rec.count) || 0, Number(x.count) || 0));
+    }
+  }
+  for (const em of Array.isArray(intel.emails) ? intel.emails : []) {
+    if (em && typeof em.email === "string") putMap("emails", em.email.slice(0, 120), { email: em.email.slice(0, 120), sameDomain: !!em.sameDomain }, em.sources);
+  }
+  for (const c of Array.isArray(intel.config) ? intel.config : []) {
+    if (c && typeof c.name === "string") putMap("config", (c.name + "=" + String(c.value)).slice(0, 200), { name: c.name.slice(0, 80), value: String(c.value).slice(0, 120) }, c.sources);
+  }
+  for (const c of Array.isArray(intel.comments) ? intel.comments : []) {
+    if (c && typeof c.text === "string") putMap("comments", c.text.slice(0, 200), { text: c.text.slice(0, 200) }, c.sources);
+  }
+  for (const sc of Array.isArray(intel.scripts) ? intel.scripts : []) {
+    if (sc && typeof sc.url === "string") putMap("scripts", sc.url.slice(0, 400), { url: sc.url.slice(0, 400), size: Number(sc.size) || 0, endpoints: Number(sc.endpoints) || 0, sourceMap: !!sc.sourceMap, chunk: !!sc.chunk }, []);
   }
   for (const c of Array.isArray(intel.cloud) ? intel.cloud : []) {
     if (!c || typeof c.value !== "string") continue;

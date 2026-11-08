@@ -2766,7 +2766,11 @@ function renderTech() {
 }
 
 
-// ---- JS Recon (v0.37) ------------------------------------------------------
+// ---- JS Recon (v0.38) ------------------------------------------------------
+// Todo lo que se muestra aquí es HIPÓTESIS derivada de leer el JS de forma
+// pasiva: ninguna ruta o parámetro se prueba contra el servidor desde esta
+// pestaña. Los valores vienen de código controlado por el sitio => siempre
+// pasan por escapeHtml() y, en CSV, por csvCell() (anti formula-injection).
 function normalizeForCompare(path) {
   return String(path || "")
     .split("?")[0]
@@ -2776,24 +2780,267 @@ function normalizeForCompare(path) {
     .replace(/\/+$/, "");
 }
 
+const JS_CATS = [
+  { id: "auth", label: "Auth", weight: 2, words: "login|logout|signin|signup|sign in|sign up|register|password|passwd|reset|forgot|verify|token|oauth2?|sso|saml|2fa|mfa|otp|session|authorize|callback", hint: "Autenticación: enumeración de usuarios, rate limiting, reset de contraseña, fijación de sesión, redirect_uri en OAuth." },
+  { id: "admin", label: "Admin", weight: 3, words: "admin|backoffice|back office|manage|management|staff|superuser|moderator|internal|console|operator|root", hint: "Funciones privilegiadas: probar con un usuario normal (BFLA / broken access control)." },
+  { id: "files", label: "Archivos", weight: 2, words: "upload|download|file|attachment|import|export|backup|dump|media|avatar|document|report", hint: "Manejo de archivos: tipo/tamaño, path traversal, SSRF por URL, archivos de otros usuarios (IDOR)." },
+  { id: "pay", label: "Pagos/negocio", weight: 2, words: "payment|billing|invoice|checkout|order|subscription|coupon|promo|refund|wallet|credit|cart|price|discount|voucher|transfer|withdraw", hint: "Lógica de negocio: manipulación de precio/cantidad, cupones reutilizables, race conditions, IDOR en pedidos." },
+  { id: "user", label: "Usuarios/tenants", weight: 1, words: "user|account|profile|customer|member|employee|me|team|org|organization|tenant|workspace|invite|role|permission", hint: "Datos de usuarios/tenants: IDOR/BOLA cambiando IDs; mass assignment (role/isAdmin) en PUT/PATCH." },
+  { id: "debug", label: "Debug/docs", weight: 3, words: "debug|actuator|swagger|openapi|api docs|graphql|graphiql|config|env|health|metrics|trace|phpinfo|test|dev|staging|status", hint: "Depuración/documentación: puede exponer esquemas, configuración o endpoints no productivos." },
+  { id: "hook", label: "URL/destino", weight: 2, words: "webhook|callback|hook|notify|redirect|return|proxy|fetch|url|link|image|preview", hint: "Aceptan URLs/destinos: SSRF, open redirect, validación del callback." },
+  { id: "search", label: "Búsqueda", weight: 1, words: "search|query|filter|find|autocomplete|suggest|lookup|list", hint: "Búsquedas/filtros: inyecciones (SQL/NoSQL/ES), operadores, paginación sin límite." },
+].map((c) => ({ ...c, re: new RegExp("(?:^|[^a-z0-9])(?:" + c.words + ")s?(?:$|[^a-z0-9])") }));
+
+const JS_PARAM_HINTS = [
+  { id: "idor", label: "IDOR/BOLA", re: /^(?:id|uid|uuid|guid|.*_?id|org|tenant|customer|owner|member|order|invoice|doc(?:ument)?|file|project|team|workspace)$/i, hint: "Cambiar por un identificador de otro usuario/tenant." },
+  { id: "ssrf", label: "SSRF / redirect", re: /^(?:url|uri|link|href|redirect(?:_?(?:uri|url|to))?|next|return(?:_?(?:to|url))?|callback(?:_?url)?|dest(?:ination)?|target|host|domain|webhook(?:_?url)?|proxy|src|source|image(?:_?url)?|avatar(?:_?url)?|feed|endpoint|continue|goto|forward)$/i, hint: "Si el servidor la consume: SSRF; si redirige: open redirect." },
+  { id: "lfi", label: "Path traversal/LFI", re: /^(?:file(?:_?name)?|path|filepath|dir|directory|folder|template|page|include|doc|document|download|load|read|resource|view|lang|locale|theme)$/i, hint: "Probar ../ y rutas absolutas dentro del scope." },
+  { id: "inj", label: "Inyección", re: /^(?:q|query|search|s|keyword|term|filter|where|sort|order(?:_?by)?|group(?:_?by)?|select|fields?|limit|offset|cmd|exec|command|expr|expression|sql|regex|pattern)$/i, hint: "Valores que llegan a consultas/filtros: SQLi/NoSQLi/ES, operadores." },
+  { id: "priv", label: "Mass assignment", re: /^(?:role|roles|is_?admin|admin|is_?staff|permissions?|scope|privilege|level|plan|tier|verified|is_?verified|active|debug|test|internal|superuser|group)$/i, hint: "Intentar enviarla en PUT/PATCH/POST de registro o perfil." },
+  { id: "secret", label: "Token/credencial", re: /^(?:token|access_?token|refresh_?token|api_?key|apikey|key|secret|client_?secret|password|passwd|pwd|auth|authorization|jwt|session(?:_?id)?|sid|otp|code)$/i, hint: "Parámetro sensible: verificar si viaja en URL/logs y si es predecible." },
+];
+
+const JS_DUMMY_HOST_RE = /^(?:[a-z]|localhost|127\.0\.0\.1|0\.0\.0\.0|example\.(?:com|org|net)|[^.]+\.(?:invalid|test|example))$/i;
+const JS_VENDOR_RE = /(?:vendor|node_modules|polyfill|runtime|framework|datadog|sentry|segment|analytics|gtag|gtm|sdk|bugsnag|newrelic|hotjar)/i;
+function jsReconIsNoise(e) {
+  if (!e.abs) return false;
+  try { return JS_DUMMY_HOST_RE.test(new URL(e.origin || "http://x").hostname); } catch { return false; }
+}
+function jsReconFileName(u) {
+  return String(u || "").split("?")[0].split("/").pop() || String(u || "");
+}
+
+function jsClassifyPath(path) {
+  const norm = String(path || "").split("?")[0].replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const padded = " " + norm + " ";
+  return JS_CATS.filter((c) => c.re.test(padded));
+}
+function jsClassifyParam(name) {
+  return JS_PARAM_HINTS.filter((h) => h.re.test(String(name || "")));
+}
+function jsClassifyExternal(host) {
+  const h = String(host || "").toLowerCase();
+  const table = [
+    ["Analytics/Ads", /(google-analytics|googletagmanager|doubleclick|facebook\.net|connect\.facebook|hotjar|segment\.(?:io|com)|mixpanel|amplitude|fullstory|clarity\.ms|heap(?:analytics)?|snap\.licdn|ads-twitter|tiktok)/],
+    ["Monitoreo", /(sentry|datadog|newrelic|bugsnag|rollbar|logrocket|honeybadger)/],
+    ["Pagos", /(stripe|paypal|braintree|adyen|checkout\.com|square|mercadopago|payu|wompi|klarna)/],
+    ["Auth/Identidad", /(auth0|okta|firebase|cognito|clerk\.|onelogin|accounts\.google|login\.microsoftonline)/],
+    ["Soporte/Marketing", /(intercom|zendesk|crisp\.chat|drift|hubspot|freshdesk|mailchimp|sendgrid|typeform)/],
+    ["CDN/Assets", /(cloudfront|cloudflare|jsdelivr|unpkg|cdnjs|fastly|akamai|fonts\.|cdn\.)/],
+    ["Cloud storage", /(amazonaws|blob\.core\.windows|storage\.googleapis|digitaloceanspaces|r2\.dev)/],
+  ];
+  for (const [label, re] of table) if (re.test(h)) return label;
+  return "Otros terceros";
+}
+
+const jsReconState = { q: "", onlyUnvisited: false, onlyApi: false, onlyShape: false, cat: "all", sort: "relevance", limit: 150, built: false };
+const jsReconOpen = new Set(["endpoints", "params"]); // secciones abiertas (persisten entre renders)
+let jsReconView = []; // filas de rutas actualmente mostradas (los botones usan su índice)
+
+function csvCell(v) {
+  let s = String(v ?? "");
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // anti CSV/formula injection: los valores vienen del sitio auditado
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+function jsReconFullUrl(e) {
+  return e.abs ? e.origin + e.path : (e.origin || `https://${currentDomain}`) + e.path;
+}
+
+function jsReconCurl(e) {
+  const url = jsReconFullUrl(e).replace(/\{param\}|\{id\}/g, "FUZZ").replace(/'/g, "'\\''");
+  const keys = (e.bodyKeys || []).filter((k) => /^[\w$.-]+$/.test(k));
+  const method = (e.methods && e.methods[0]) || (keys.length ? "POST" : "GET");
+  let cmd = `curl -i -s -X ${method} '${url}' -H 'Cookie: <COOKIE>' -H 'Authorization: Bearer <TOKEN>'`;
+  if (keys.length && method !== "GET" && method !== "DELETE") {
+    cmd += ` -H 'Content-Type: application/json' --data '{${keys.map((k) => `"${k}":"FUZZ"`).join(",")}}'`;
+  }
+  return cmd;
+}
+
+function jsReconRaw(e) {
+  let host = "target";
+  let path = e.path;
+  try { const u = new URL(jsReconFullUrl(e)); host = u.host; path = u.pathname + u.search; } catch {}
+  path = path.replace(/\{param\}|\{id\}/g, "FUZZ");
+  const keys = (e.bodyKeys || []).filter((k) => /^[\w$.-]+$/.test(k));
+  const method = (e.methods && e.methods[0]) || (keys.length ? "POST" : "GET");
+  const body = keys.length && method !== "GET" && method !== "DELETE" ? `{${keys.map((k) => `"${k}":"FUZZ"`).join(",")}}` : "";
+  return `${method} ${path} HTTP/1.1\r\nHost: ${host}\r\nCookie: <COOKIE>\r\nAuthorization: Bearer <TOKEN>\r\n` +
+    (body ? `Content-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body}` : "\r\n");
+}
+
+const jsReconExpanded = new Set(); // rutas ampliadas con doble clic (persisten entre renders)
+function jsReconKey(r) { return (r.abs ? r.origin : "") + r.path; }
+
+function jsReconDetailHtml(r, i) {
+  const when = (t) => (t ? new Date(t).toLocaleString() : "—");
+  const field = (label, body) => `<div style="margin-top:6px"><span class="hint">${label}</span><div>${body}</div></div>`;
+  const hyps = [];
+  if (r.unvisited) hyps.push("Ruta que la UI no llamó mientras navegabas: ejecutar la funcionalidad correspondiente para capturar tráfico real (cuerpo, cabeceras, respuesta).");
+  if (r.methods.some((m) => /^(POST|PUT|PATCH|DELETE)$/.test(m))) hyps.push("Método que modifica datos: probar con un usuario sin permisos (BFLA) y con IDs de otro usuario/tenant (BOLA).");
+  if (r.dynamic && r.path.endsWith("/")) hyps.push("El JS concatena un valor al final de la ruta: reemplazarlo por un identificador ajeno.");
+  for (const c of r.cats) hyps.push(`${c.label}: ${c.hint}`);
+  for (const k of r.bodyKeys) for (const h of jsClassifyParam(k)) hyps.push(`Parámetro «${k}» (${h.label}): ${h.hint}`);
+  const ctxBySource = new Map((r.contexts || []).map((c) => [c.source, c.snippet]));
+  const sources = (r.sources || []).map((s) => {
+    const safe = /^https?:\/\//i.test(s);
+    const snip = ctxBySource.get(s);
+    return `<div style="margin-top:4px">${safe ? `<a href="${escapeHtml(s)}" target="_blank" rel="noopener noreferrer" class="mono">${escapeHtml(s)}</a>` : `<span class="mono">${escapeHtml(s)}</span>`}
+      ${snip ? `<pre class="mono" style="max-height:110px;overflow:auto;white-space:pre-wrap;user-select:text">${escapeHtml(snip)}</pre>` : ""}</div>`;
+  }).join("") || `<span class="hint">sin información de origen</span>`;
+  const keys = r.bodyKeys.map((k) => {
+    const hs = jsClassifyParam(k);
+    return `<div><span class="mono" style="${hs.length ? "color:#ffb74d" : ""}">${escapeHtml(k)}</span>${hs.map((h) => ` <span class="badge medium" title="${escapeHtml(h.hint)}">${escapeHtml(h.label)}</span>`).join("")}</div>`;
+  }).join("");
+  return `<div class="jsr-detail" style="margin-top:8px;padding:8px;border-left:3px solid var(--accent,#00ffb0);background:rgba(0,255,176,.04)">
+    ${field("URL completa", `<span class="mono" style="user-select:text">${escapeHtml(jsReconFullUrl(r))}</span>`)}
+    ${field("Estado y método", `${r.unvisited ? "Sin visitar (no aparece en el tráfico observado)" : "Ya vista en tráfico real"} · ${r.methods.length ? escapeHtml(r.methods.join(", ")) : "método no inferido"}${r.vendorOnly ? " · solo en archivos de librería/SDK (probablemente no es del objetivo)" : ""}`)}
+    ${keys ? field("Parámetros / claves del body", keys) : ""}
+    ${field("Dónde aparece en el código", sources)}
+    ${field("Primera / última vez visto", `${escapeHtml(when(r.firstSeen))} · ${escapeHtml(when(r.lastSeen))}`)}
+    ${hyps.length ? field("Qué probar (hipótesis, solo dentro del scope)", `<ul style="margin:2px 0 0 18px;padding:0">${[...new Set(hyps)].map((h) => `<li>${escapeHtml(h)}</li>`).join("")}</ul>`) : ""}
+    <div style="margin-top:8px"><button data-act="copy-url" data-i="${i}">Copiar URL</button> <button data-act="copy-curl" data-i="${i}">Copiar curl</button> <button data-act="copy-raw" data-i="${i}">Copiar petición cruda (Burp)</button></div></div>`;
+}
+
+function jsReconScore(e) {
+  let sc = 0;
+  if (e.unvisited) sc += 4;
+  if (e.hint) sc += 3;
+  if ((e.methods || []).some((m) => /^(POST|PUT|PATCH|DELETE)$/.test(m))) sc += 2;
+  if ((e.bodyKeys || []).length) sc += 1;
+  for (const c of e.cats) sc += c.weight;
+  for (const k of e.bodyKeys || []) if (jsClassifyParam(k).length) sc += 1;
+  if (e.vendorOnly) sc -= 4;
+  return sc;
+}
+
 function renderJsRecon() {
   const el = document.getElementById("jsrecon-list");
   if (!el) return;
   const j = currentData.jsIntel || {};
-  const endpoints = Object.values(j.endpoints || {});
-  const cloud = Object.values(j.cloud || {});
-  const internal = Object.values(j.internal || {});
-  const hosts = Object.values(j.hosts || {});
-  const pms = Object.values(j.postMessage || {});
-  const wss = Object.values(j.websockets || {});
-  const params = j.params || [];
+  const vals = (k) => Object.values(j[k] || {});
+  const endpointsRaw = vals("endpoints");
+  const buckets = {
+    routes: vals("routes"), graphql: vals("graphql"), hosts: vals("hosts"), external: vals("external"), cloud: vals("cloud"),
+    internal: vals("internal"), config: vals("config"), emails: vals("emails"), comments: vals("comments"),
+    pms: vals("postMessage"), wss: vals("websockets"), scripts: vals("scripts"),
+  };
+  const params = Array.isArray(j.params) ? j.params : [];
+  const anyData = endpointsRaw.length || params.length || Object.values(buckets).some((a) => a.length);
 
-  if (![endpoints, cloud, internal, hosts, pms, wss, params].some((a) => a.length)) {
+  if (!anyData) {
     el.innerHTML = `<div class="empty">Sin inteligencia de JS aún. Navegá el objetivo para que se analicen sus bundles.</div>`;
+    jsReconState.built = false;
     return;
   }
 
-  // ¿Qué rutas del JS nunca se vieron en tráfico real?
+  // ---- esqueleto de controles: se crea una sola vez para no perder el foco al escribir ----
+  if (!jsReconState.built || !el.querySelector("#jsrecon-q")) {
+    el.innerHTML = `
+      <div id="jsrecon-controls" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
+        <input id="jsrecon-q" type="search" placeholder="Buscar: ruta, parámetro, host, script…" style="min-width:260px;flex:1 1 260px">
+        <label><input type="checkbox" id="jsrecon-f-unvisited"> Solo sin visitar</label>
+        <label><input type="checkbox" id="jsrecon-f-api"> Solo tipo API</label>
+        <label><input type="checkbox" id="jsrecon-f-shape"> Con método/params conocidos</label>
+        <select id="jsrecon-cat"><option value="all">Todas las categorías</option>${JS_CATS.map((c) => `<option value="${c.id}">${escapeHtml(c.label)}</option>`).join("")}</select>
+        <select id="jsrecon-sort"><option value="relevance">Orden: relevancia</option><option value="alpha">Orden: alfabético</option><option value="script">Orden: por script</option></select>
+      </div>
+      <div id="jsrecon-actions" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px"></div>
+      <div id="jsrecon-summary" style="margin-bottom:10px"></div>
+      <div id="jsrecon-results"></div>`;
+    jsReconState.built = true;
+    const bind = (id, ev, fn) => { const n = el.querySelector(id); if (n) n.addEventListener(ev, fn); };
+    bind("#jsrecon-q", "input", (e) => { jsReconState.q = e.target.value; jsReconState.limit = 150; renderJsReconResults(); });
+    bind("#jsrecon-f-unvisited", "change", (e) => { jsReconState.onlyUnvisited = e.target.checked; jsReconState.limit = 150; renderJsReconResults(); });
+    bind("#jsrecon-f-api", "change", (e) => { jsReconState.onlyApi = e.target.checked; jsReconState.limit = 150; renderJsReconResults(); });
+    bind("#jsrecon-f-shape", "change", (e) => { jsReconState.onlyShape = e.target.checked; jsReconState.limit = 150; renderJsReconResults(); });
+    bind("#jsrecon-cat", "change", (e) => { jsReconState.cat = e.target.value; jsReconState.limit = 150; renderJsReconResults(); });
+    bind("#jsrecon-sort", "change", (e) => { jsReconState.sort = e.target.value; renderJsReconResults(); });
+    const results = el.querySelector("#jsrecon-results");
+    results.addEventListener("toggle", (e) => {
+      const id = e.target?.dataset?.sec;
+      if (!id) return;
+      if (e.target.open) jsReconOpen.add(id); else jsReconOpen.delete(id);
+    }, true);
+    results.addEventListener("dblclick", (e) => {
+      if (e.target.closest("button, a, pre, summary, input, select")) return; // no estorbar copiar/seleccionar
+      const rowEl = e.target.closest(".jsr-row");
+      if (!rowEl) return;
+      const r = jsReconView[Number(rowEl.dataset.i)];
+      if (!r) return;
+      const key = jsReconKey(r);
+      const open = !jsReconExpanded.has(key);
+      if (open) jsReconExpanded.add(key); else jsReconExpanded.delete(key);
+      const old = rowEl.querySelector(".jsr-detail");
+      if (old) old.remove();
+      if (open) rowEl.insertAdjacentHTML("beforeend", jsReconDetailHtml(r, Number(rowEl.dataset.i)));
+      try { window.getSelection()?.removeAllRanges(); } catch {}
+    });
+    const onClick = (e) => {
+      const btn = e.target.closest("[data-act]");
+      if (!btn) return;
+      const act = btn.dataset.act;
+      if (act === "more") { jsReconState.limit += 150; renderJsReconResults(); return; }
+      if (act === "jump") {
+        const sec = el.querySelector(`details[data-sec="${CSS.escape(btn.dataset.sec || "")}"]`);
+        if (sec) { sec.open = true; jsReconOpen.add(sec.dataset.sec); sec.scrollIntoView({ block: "start" }); }
+        return;
+      }
+      jsReconAction(act, btn);
+    };
+    el.addEventListener("click", onClick);
+  }
+  renderJsReconResults();
+}
+
+async function jsReconCopy(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+    const prev = btn.textContent;
+    btn.textContent = "¡Copiado!";
+    setTimeout(() => { btn.textContent = prev; }, 1200);
+  } catch {
+    // el clipboard puede fallar sin foco; no rompe el resto del panel
+  }
+}
+
+async function jsReconDownload(content, filename, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  try {
+    if (ext.downloads?.download) await ext.downloads.download({ url, filename });
+    else window.open(url);
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+}
+
+function jsReconAction(act, btn) {
+  const j = currentData.jsIntel || {};
+  const row = jsReconView[Number(btn.dataset.i)];
+  const allRows = jsReconAllRows();
+  switch (act) {
+    case "copy-url": if (row) jsReconCopy(jsReconFullUrl(row), btn); break;
+    case "copy-curl": if (row) jsReconCopy(jsReconCurl(row), btn); break;
+    case "copy-raw": if (row) jsReconCopy(jsReconRaw(row), btn); break;
+    case "copy-unvisited": jsReconCopy([...new Set(allRows.filter((r) => r.unvisited).map(jsReconFullUrl))].join("\n"), btn); break;
+    case "copy-ffuf": jsReconCopy([...new Set(allRows.map((r) => r.path.split("?")[0].replace(/\{param\}|\{id\}/g, "FUZZ").replace(/^\//, "")))].join("\n"), btn); break;
+    case "copy-params": jsReconCopy(jsReconAllParams().map((p) => p.name).join("\n"), btn); break;
+    case "copy-hosts": jsReconCopy([...new Set([...Object.values(j.hosts || {}).map((h) => h.host), ...Object.values(j.external || {}).map((h) => h.host)])].join("\n"), btn); break;
+    case "export-json": jsReconDownload(JSON.stringify(j, null, 2), `jsrecon-${currentDomain}.json`, "application/json"); break;
+    case "export-csv": {
+      const head = ["estado", "metodos", "categorias", "ruta", "origen", "parametros", "fuentes"].map(csvCell).join(",");
+      const lines = allRows.map((r) => [r.unvisited ? "sin visitar" : "visto", (r.methods || []).join("|"), r.cats.map((c) => c.label).join("|"), r.path, r.origin || "", (r.bodyKeys || []).join("|"), (r.sources || []).join(" ")].map(csvCell).join(","));
+      jsReconDownload([head, ...lines].join("\n"), `jsrecon-rutas-${currentDomain}.csv`, "text/csv");
+      break;
+    }
+    default: break;
+  }
+}
+
+function jsReconAllRows() {
+  const j = currentData.jsIntel || {};
   const observed = new Set();
   for (const ep of Object.values(currentData.endpoints || {})) {
     try {
@@ -2802,100 +3049,200 @@ function renderJsRecon() {
       observed.add(normalizeForCompare(u.origin + u.pathname));
     } catch {}
   }
-  const rows = endpoints
-    .map((e) => {
-      const key = e.abs ? normalizeForCompare(e.origin + e.path) : normalizeForCompare(e.path);
-      return { ...e, unvisited: !observed.has(key) };
-    })
-    .sort((a, b) => Number(b.unvisited) - Number(a.unvisited) || Number(b.hint) - Number(a.hint) || a.path.localeCompare(b.path));
-  const unvisitedCount = rows.filter((r) => r.unvisited).length;
-  const MAX_ROWS = 150;
-  const fullUrl = (e) => (e.abs ? e.origin + e.path : (e.origin || `https://${currentData.domain}`) + e.path);
+  return Object.values(j.endpoints || {}).filter((e) => !jsReconIsNoise(e)).map((e) => {
+    const key = e.abs ? normalizeForCompare(e.origin + e.path) : normalizeForCompare(e.path);
+    const srcs = e.sources || [];
+    const row = { ...e, methods: e.methods || [], bodyKeys: e.bodyKeys || [], unvisited: !observed.has(key), cats: jsClassifyPath(e.path), vendorOnly: srcs.length > 0 && srcs.every((x) => JS_VENDOR_RE.test(jsReconFileName(x))) };
+    row.score = jsReconScore(row);
+    return row;
+  });
+}
 
-  const section = (title, body) => `<div class="detail-block" style="margin-bottom:12px"><b>${title}</b>${body}</div>`;
-  const srcLine = (r) => `<div class="hint" style="margin-top:2px">${(r.sources || []).slice(0, 2).map((x) => escapeHtml(String(x).split("/").slice(-1)[0] || x)).join(" · ")}</div>`;
+function jsReconAllParams() {
+  const j = currentData.jsIntel || {};
+  const map = new Map();
+  const add = (name, from) => {
+    if (!name || typeof name !== "string") return;
+    const e = map.get(name) || { name, count: 0, where: new Set() };
+    e.count++;
+    if (from) e.where.add(from);
+    map.set(name, e);
+  };
+  for (const n of Array.isArray(j.params) ? j.params : []) add(n, "query");
+  for (const r of Object.values(j.endpoints || {})) for (const k of r.bodyKeys || []) add(k, "body");
+  return [...map.values()].map((p) => ({ ...p, where: [...p.where], hints: jsClassifyParam(p.name) })).sort((a, b) => b.hints.length - a.hints.length || b.count - a.count || a.name.localeCompare(b.name));
+}
 
-  let html = "";
+function renderJsReconResults() {
+  const el = document.getElementById("jsrecon-list");
+  const results = el?.querySelector("#jsrecon-results");
+  if (!results) return;
+  const j = currentData.jsIntel || {};
+  const vals = (k) => Object.values(j[k] || {});
+  const st = jsReconState;
+  const q = st.q.trim().toLowerCase();
+  const hay = (...parts) => !q || parts.join(" ").toLowerCase().includes(q);
+  const base = (u) => String(u || "").split("?")[0].split("/").pop() || String(u);
 
-  html += section(
-    `Rutas en el JS (${rows.length}, ${unvisitedCount} sin visitar)`,
-    `<div style="margin:6px 0"><button class="btn" id="jsrecon-copy-unvisited">Copiar URLs sin visitar</button>
-       <button class="btn" id="jsrecon-copy-params">Copiar ${params.length} parámetros (wordlist)</button></div>` +
-      (rows.length
-        ? rows.slice(0, MAX_ROWS).map((r) => `<div class="row" style="margin-top:4px">
-            <span class="badge ${r.unvisited ? (r.hint ? "high" : "medium") : "low"}">${r.unvisited ? "sin visitar" : "visto"}</span>
-            ${r.hint ? `<span class="badge medium">API</span>` : ""}
-            <span class="mono">${escapeHtml(r.abs ? r.origin + r.path : r.path)}</span>${srcLine(r)}</div>`).join("") +
-          (rows.length > MAX_ROWS ? `<div class="hint">+${rows.length - MAX_ROWS} más (usá "Copiar URLs sin visitar" para el listado completo)</div>` : "")
-        : `<div class="empty">Ninguna ruta extraída.</div>`)
-  );
+  // ---- rutas ----
+  let rows = jsReconAllRows().filter((r) => {
+    if (st.onlyUnvisited && !r.unvisited) return false;
+    if (st.onlyApi && !r.hint) return false;
+    if (st.onlyShape && !r.methods.length && !r.bodyKeys.length) return false;
+    if (st.cat !== "all" && !r.cats.some((c) => c.id === st.cat)) return false;
+    return hay(r.path, r.origin, r.methods.join(" "), r.bodyKeys.join(" "), (r.sources || []).join(" "), r.cats.map((c) => c.label).join(" "));
+  });
+  if (st.sort === "alpha") rows.sort((a, b) => a.path.localeCompare(b.path));
+  else if (st.sort === "script") rows.sort((a, b) => String((a.sources || [])[0] || "").localeCompare(String((b.sources || [])[0] || "")) || a.path.localeCompare(b.path));
+  else rows.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+  const allRows = jsReconAllRows();
+  jsReconView = rows.slice(0, st.limit);
 
-  if (cloud.length) {
-    html += section(
-      `Activos cloud / candidatos a takeover (${cloud.length})`,
-      cloud.map((c) => `<div class="row" style="margin-top:6px"><span class="badge medium">${escapeHtml(c.kind)}</span> <span class="mono">${escapeHtml(c.value)}</span>
-        <div class="hint" style="margin-top:2px">${escapeHtml(c.hint || "")}</div>${srcLine(c)}</div>`).join("")
-    );
+  const srcLine = (r) => `<div class="hint" style="margin-top:2px">${(r.sources || []).slice(0, 3).map((x) => `<span title="${escapeHtml(x)}">${escapeHtml(base(x))}</span>`).join(" · ")}</div>`;
+  const section = (id, title, count, body, help) =>
+    `<details data-sec="${id}" ${jsReconOpen.has(id) ? "open" : ""} style="margin-bottom:10px"><summary><b>${title}</b> <span class="hint">(${count})</span></summary>${help ? `<div class="hint" style="margin:4px 0">${help}</div>` : ""}${body}</details>`;
+
+  const epRows = jsReconView.map((r, i) => {
+    const catBadges = r.cats.map((c) => `<span class="badge low" title="${escapeHtml(c.hint)}">${escapeHtml(c.label)}</span>`).join(" ");
+    const mBadges = r.methods.map((m) => `<span class="badge ${/^(POST|PUT|PATCH|DELETE)$/.test(m) ? "high" : "low"}">${escapeHtml(m)}</span>`).join(" ");
+    const keyChips = r.bodyKeys.map((k) => {
+      const hs = jsClassifyParam(k);
+      return `<span class="mono" style="${hs.length ? "color:#ffb74d" : ""}" title="${escapeHtml(hs.map((h) => h.label).join(", "))}">${escapeHtml(k)}</span>`;
+    }).join(" · ");
+    return `<div class="row jsr-row" data-i="${i}" title="Doble clic para ampliar" style="margin-top:4px;cursor:pointer">
+      <span class="badge ${r.unvisited ? (r.hint ? "high" : "medium") : "low"}">${r.unvisited ? "sin visitar" : "visto"}</span>${r.vendorOnly ? ` <span class="badge low" title="Solo aparece en archivos de librería/SDK: probablemente no es del objetivo">librería</span>` : ""}
+      ${mBadges}${r.hint ? ` <span class="badge medium">API</span>` : ""}${r.dynamic && r.path.endsWith("/") ? ` <span class="badge low" title="El JS concatena un valor al final (p. ej. '/api/users/' + id)">prefijo dinámico</span>` : ""} ${catBadges}
+      <span class="mono">${escapeHtml(r.abs ? r.origin + r.path : r.path)}</span>
+      ${keyChips ? `<div class="hint" style="margin-top:2px">parámetros/body: ${keyChips}</div>` : ""}
+      ${srcLine(r)}
+      <div style="margin-top:3px"><button data-act="copy-url" data-i="${i}">Copiar URL</button> <button data-act="copy-curl" data-i="${i}">Copiar curl</button> <span class="hint">· doble clic para ampliar</span></div>${jsReconExpanded.has(jsReconKey(r)) ? jsReconDetailHtml(r, i) : ""}</div>`;
+  }).join("");
+  const moreBtn = rows.length > jsReconView.length ? `<div style="margin-top:6px"><button data-act="more">Mostrar ${Math.min(150, rows.length - jsReconView.length)} más (${rows.length - jsReconView.length} restantes)</button></div>` : "";
+  const catHints = [...new Map(rows.flatMap((r) => r.cats).map((c) => [c.id, c])).values()].map((c) => `<div class="hint"><b>${escapeHtml(c.label)}:</b> ${escapeHtml(c.hint)}</div>`).join("");
+
+  let html = section("endpoints", "Rutas y endpoints en el JS", `${rows.length} de ${allRows.length} · ${allRows.filter((r) => r.unvisited).length} sin visitar`,
+    (epRows || `<div class="empty">Ninguna ruta coincide con los filtros.</div>`) + moreBtn + (catHints ? `<div style="margin-top:8px">${catHints}</div>` : ""),
+    "Ordenadas por relevancia: sin visitar + API + métodos que modifican datos + categorías sensibles + parámetros interesantes. Doble clic en una ruta para ampliar su ficha (URL completa, código donde aparece, parámetros y qué probar).");
+
+  // ---- parámetros ----
+  const prm = jsReconAllParams().filter((p) => hay(p.name, p.hints.map((h) => h.label).join(" ")));
+  html += section("params", "Parámetros descubiertos", prm.length,
+    prm.slice(0, 300).map((p) => `<div class="row" style="margin-top:3px"><span class="mono">${escapeHtml(p.name)}</span> <span class="hint">×${p.count} · ${escapeHtml(p.where.join("/"))}</span>
+      ${p.hints.map((h) => `<span class="badge medium" title="${escapeHtml(h.hint)}">${escapeHtml(h.label)}</span>`).join(" ")}</div>`).join("") || `<div class="empty">Sin parámetros.</div>`,
+    "Nombres vistos en query strings y bodies dentro del JS. Los marcados son candidatos a la clase de bug indicada (hipótesis).");
+
+  // ---- rutas del front ----
+  const routes = vals("routes").filter((r) => hay(r.path));
+  if (routes.length) html += section("routes", "Rutas del front (páginas SPA)", routes.length,
+    routes.map((r) => `<div class="row" style="margin-top:3px"><span class="mono">${escapeHtml(r.path)}</span>${jsClassifyPath(r.path).map((c) => ` <span class="badge low">${escapeHtml(c.label)}</span>`).join("")}${srcLine(r)}</div>`).join(""),
+    "Páginas definidas en el router del cliente (incluye paneles admin/ocultos). Que exista la ruta no implica que el backend la proteja: probar acceso directo.");
+
+  // ---- GraphQL ----
+  const gql = vals("graphql").filter((g) => hay(g.kind, g.name, g.snippet));
+  if (gql.length) html += section("graphql", "Operaciones GraphQL en el JS", gql.length,
+    gql.map((g) => `<div class="row" style="margin-top:4px"><span class="badge ${g.kind === "mutation" ? "high" : "low"}">${escapeHtml(g.kind)}</span> <b>${escapeHtml(g.name)}</b>
+      <pre class="mono" style="max-height:70px;overflow:auto;white-space:pre-wrap">${escapeHtml(g.snippet || "")}</pre>${srcLine(g)}</div>`).join(""),
+    "Útil para reconstruir el esquema aunque introspection esté deshabilitada: probar cada mutation con otro usuario (BOLA/BFLA).");
+
+  // ---- hosts ----
+  const hosts = vals("hosts").filter((h) => hay(h.host)).sort((a, b) => Number(b.envLike) - Number(a.envLike));
+  if (hosts.length) html += section("hosts", "Subdominios del objetivo mencionados en el JS", hosts.length,
+    hosts.map((h) => `<div class="row" style="margin-top:3px">${h.envLike ? `<span class="badge high">entorno no prod</span>` : `<span class="badge low">subdominio</span>`} <span class="mono">${escapeHtml(h.host)}</span>${srcLine(h)}</div>`).join(""));
+
+  // ---- terceros ----
+  const ext3 = vals("external").filter((x) => hay(x.host, jsClassifyExternal(x.host)));
+  if (ext3.length) {
+    const groups = new Map();
+    for (const x of ext3) { const g = jsClassifyExternal(x.host); (groups.get(g) || groups.set(g, []).get(g)).push(x); }
+    html += section("external", "Servicios y dominios externos", ext3.length,
+      [...groups.entries()].sort((a, b) => b[1].length - a[1].length).map(([g, list]) => `<div style="margin-top:6px"><b>${escapeHtml(g)}</b> <span class="hint">(${list.length})</span>
+        ${list.sort((a, b) => b.count - a.count).map((x) => `<div class="row" style="margin-top:2px"><span class="mono">${escapeHtml(x.host)}</span> <span class="hint">×${x.count}</span></div>`).join("")}</div>`).join(""),
+      "Superficie de terceros: cuentas SaaS huérfanas, claves públicas, integraciones con webhooks o dominios que podrían ser tomados (takeover).");
   }
 
-  if (hosts.length) {
-    html += section(
-      `Subdominios mencionados en el JS (${hosts.length})`,
-      hosts.sort((a, b) => Number(b.envLike) - Number(a.envLike)).map((h) => `<div class="row" style="margin-top:4px">
-        ${h.envLike ? `<span class="badge high">entorno no prod</span>` : `<span class="badge low">subdominio</span>`}
-        <span class="mono">${escapeHtml(h.host)}</span>${srcLine(h)}</div>`).join("")
-    );
-  }
+  // ---- cloud ----
+  const cloud = vals("cloud").filter((c) => hay(c.kind, c.value));
+  if (cloud.length) html += section("cloud", "Activos cloud / candidatos a takeover", cloud.length,
+    cloud.map((c) => `<div class="row" style="margin-top:6px"><span class="badge medium">${escapeHtml(c.kind)}</span> <span class="mono">${escapeHtml(c.value)}</span><div class="hint" style="margin-top:2px">${escapeHtml(c.hint || "")}</div>${srcLine(c)}</div>`).join(""));
 
-  if (internal.length) {
-    html += section(
-      `IPs/hosts internos filtrados (${internal.length})`,
-      internal.map((i) => `<div class="row" style="margin-top:4px"><span class="badge medium">interno</span> <span class="mono">${escapeHtml(i.value)}</span>${srcLine(i)}</div>`).join("")
-    );
-  }
+  // ---- internos ----
+  const internal = vals("internal").filter((i) => hay(i.value));
+  if (internal.length) html += section("internal", "IPs/hosts internos filtrados", internal.length,
+    internal.map((i) => `<div class="row" style="margin-top:3px"><span class="badge medium">interno</span> <span class="mono">${escapeHtml(i.value)}</span>${srcLine(i)}</div>`).join(""));
 
+  // ---- config/env ----
+  const cfg = vals("config").filter((c) => hay(c.name, c.value));
+  if (cfg.length) html += section("config", "Config / variables de entorno / feature flags", cfg.length,
+    cfg.map((c) => `<div class="row" style="margin-top:3px"><span class="mono">${escapeHtml(c.name)}</span> = <span class="mono">${escapeHtml(c.value)}</span>${srcLine(c)}</div>`).join(""),
+    "Valores que el build dejó en el cliente: URLs de API internas, IDs de tenant, flags de funciones ocultas (ENABLE_*, FEATURE_*).");
+
+  // ---- emails ----
+  const emails = vals("emails").filter((e) => hay(e.email));
+  if (emails.length) html += section("emails", "Emails en el JS", emails.length,
+    emails.map((e) => `<div class="row" style="margin-top:3px">${e.sameDomain ? `<span class="badge medium">dominio propio</span>` : `<span class="badge low">externo</span>`} <span class="mono">${escapeHtml(e.email)}</span>${srcLine(e)}</div>`).join(""));
+
+  // ---- comentarios ----
+  const comments = vals("comments").filter((c) => hay(c.text));
+  if (comments.length) html += section("comments", "Comentarios de desarrollo", comments.length,
+    comments.map((c) => `<div class="row" style="margin-top:3px"><span class="mono">${escapeHtml(c.text)}</span>${srcLine(c)}</div>`).join(""),
+    "TODO/FIXME/menciones de credenciales en builds sin minificar o HTML inline. Suelen ser pistas, no hallazgos por sí solos.");
+
+  // ---- postMessage ----
+  const pms = vals("postMessage").filter((m) => hay(m.snippet, (m.sinks || []).join(" "), m.script || ""));
   if (pms.length) {
     const lvl = { HIGH: "high", MED: "medium", LOW: "low" };
-    html += section(
-      `Listeners de postMessage (${pms.length})`,
-      `<div class="hint">CANDIDATE: se inspecciona el código del handler; no se envía ningún mensaje. HIGH = usa un sink peligroso sin ver chequeo de origin.</div>` +
-      pms.sort((a, b) => ({ HIGH: 0, MED: 1, LOW: 2 }[a.level] - { HIGH: 0, MED: 1, LOW: 2 }[b.level])).map((m) => `<div class="row" style="margin-top:6px">
-        <span class="badge ${lvl[m.level] || "low"}">${escapeHtml(m.level)}</span>
+    const ord = { HIGH: 0, MED: 1, LOW: 2 };
+    html += section("pm", "Listeners de postMessage", pms.length,
+      pms.sort((a, b) => ord[a.level] - ord[b.level]).map((m) => `<div class="row" style="margin-top:6px"><span class="badge ${lvl[m.level] || "low"}">${escapeHtml(m.level)}</span>
         <b>${m.checksOrigin ? "valida origin" : "sin chequeo de origin visible"}</b>${m.sinks?.length ? ` · sinks: <span class="mono">${m.sinks.map(escapeHtml).join(", ")}</span>` : ""}
         ${m.script ? `<div class="hint">script: ${escapeHtml(m.script)}</div>` : ""}
-        <pre class="mono" style="background:var(--bg2,#0b0f0d);padding:6px;max-height:140px;overflow:auto;white-space:pre-wrap">${escapeHtml(m.snippet || "")}</pre>
-        <div class="hint">Validación: desde una página que controlás, abrí el sitio con window.open y enviá un postMessage con el payload (solo en scope).</div></div>`).join("")
-    );
+        <pre class="mono" style="max-height:140px;overflow:auto;white-space:pre-wrap">${escapeHtml(m.snippet || "")}</pre></div>`).join(""),
+      "CANDIDATE: se inspecciona el código del handler; no se envía ningún mensaje. HIGH = sink peligroso sin chequeo de origin visible. Validar desde una página que controlás, solo en scope.");
   }
 
-  if (wss.length) {
-    html += section(
-      `WebSockets (${wss.length})`,
-      wss.map((w) => `<div class="row" style="margin-top:6px">
-        ${w.insecure ? `<span class="badge high">ws:// sin TLS</span>` : ""}${w.tokenInUrl ? `<span class="badge high">token en URL</span>` : ""}
-        <span class="mono">${escapeHtml(w.url)}</span>
-        ${w.script ? `<div class="hint">script: ${escapeHtml(w.script)}</div>` : ""}
-        ${(w.samples || []).map((s) => `<pre class="mono" style="max-height:80px;overflow:auto;white-space:pre-wrap">${escapeHtml(s)}</pre>`).join("")}
-        <div class="hint">Probar: autorización por mensaje (IDOR en IDs de canal/sala), Origin no validado (CSWSH) y suscripción sin sesión.</div></div>`).join("")
-    );
+  // ---- websockets ----
+  const wss = vals("websockets").filter((w) => hay(w.url));
+  if (wss.length) html += section("ws", "WebSockets", wss.length,
+    wss.map((w) => `<div class="row" style="margin-top:6px">${w.insecure ? `<span class="badge high">ws:// sin TLS</span>` : ""}${w.tokenInUrl ? `<span class="badge high">token en URL</span>` : ""}
+      <span class="mono">${escapeHtml(w.url)}</span>${w.script ? `<div class="hint">script: ${escapeHtml(w.script)}</div>` : ""}
+      ${(w.samples || []).map((s) => `<pre class="mono" style="max-height:80px;overflow:auto;white-space:pre-wrap">${escapeHtml(s)}</pre>`).join("")}</div>`).join(""),
+    "Probar: autorización por mensaje (IDOR en IDs de canal/sala), Origin no validado (CSWSH) y suscripción sin sesión.");
+
+  // ---- inventario de scripts ----
+  const scripts = vals("scripts").filter((s) => hay(s.url)).sort((a, b) => Number(b.sourceMap) - Number(a.sourceMap) || b.endpoints - a.endpoints);
+  if (scripts.length) html += section("scripts", "Archivos JS analizados", scripts.length,
+    scripts.slice(0, 200).map((s) => {
+      const safe = /^https?:\/\//i.test(s.url);
+      const label = escapeHtml(base(s.url));
+      return `<div class="row" style="margin-top:3px">${s.sourceMap ? `<span class="badge high" title="Con source map: el código original puede reconstruirse">source map</span>` : ""}${s.chunk ? ` <span class="badge low">chunk</span>` : ""}
+        ${safe ? `<a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer" class="mono" title="${escapeHtml(s.url)}">${label}</a>` : `<span class="mono">${label}</span>`}
+        <span class="hint">${(s.size / 1024).toFixed(1)} KB · ${s.endpoints} rutas nuevas</span></div>`;
+    }).join(""),
+    "Los scripts con source map son los más valiosos: permiten leer el código original.");
+
+  results.innerHTML = html;
+
+  // ---- acciones y resumen ----
+  const actions = el.querySelector("#jsrecon-actions");
+  if (actions) actions.innerHTML = `
+    <button data-act="copy-unvisited">Copiar URLs sin visitar</button>
+    <button data-act="copy-ffuf">Copiar rutas (ffuf, FUZZ)</button>
+    <button data-act="copy-params">Copiar parámetros (wordlist)</button>
+    <button data-act="copy-hosts">Copiar hosts</button>
+    <button data-act="export-csv">Exportar rutas CSV</button>
+    <button data-act="export-json">Exportar JSON</button>`;
+  const summary = el.querySelector("#jsrecon-summary");
+  if (summary) {
+    const chip = (sec, label, n, hot) => n ? `<button data-act="jump" data-sec="${sec}" style="margin:0 4px 4px 0;${hot ? "border-color:var(--accent)" : ""}">${escapeHtml(label)}: <b>${n}</b></button>` : "";
+    const b = (k) => vals(k).length;
+    summary.innerHTML = [
+      chip("endpoints", "rutas", allRows.length), chip("endpoints", "sin visitar", allRows.filter((r) => r.unvisited).length, true),
+      chip("params", "parámetros", jsReconAllParams().length), chip("routes", "rutas SPA", b("routes")), chip("graphql", "GraphQL", b("graphql"), true),
+      chip("hosts", "subdominios", b("hosts")), chip("external", "externos", b("external")), chip("cloud", "cloud", b("cloud"), true),
+      chip("internal", "internos", b("internal"), true), chip("config", "config", b("config")), chip("emails", "emails", b("emails")),
+      chip("comments", "comentarios", b("comments")), chip("pm", "postMessage", b("postMessage"), true), chip("ws", "websockets", b("websockets")), chip("scripts", "scripts", b("scripts")),
+    ].join("");
   }
-
-  el.innerHTML = html;
-
-  const copy = async (text, btn) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      const prev = btn.textContent;
-      btn.textContent = "¡Copiado!";
-      setTimeout(() => { btn.textContent = prev; }, 1200);
-    } catch {
-      // el clipboard puede fallar sin permiso de foco; no rompe el resto del panel
-    }
-  };
-  const b1 = document.getElementById("jsrecon-copy-unvisited");
-  if (b1) b1.addEventListener("click", () => copy([...new Set(rows.filter((r) => r.unvisited).map(fullUrl))].join("\n"), b1));
-  const b2 = document.getElementById("jsrecon-copy-params");
-  if (b2) b2.addEventListener("click", () => copy(params.join("\n"), b2));
 }
 
 function renderGraphQL() {

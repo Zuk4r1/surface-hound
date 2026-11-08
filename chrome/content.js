@@ -339,80 +339,203 @@
   }
 
   function newIntel() {
-    return { endpoints: new Map(), cloud: new Map(), internal: new Map(), hosts: new Map(), params: new Set() };
+    return {
+      endpoints: new Map(), cloud: new Map(), internal: new Map(), hosts: new Map(), params: new Set(),
+      routes: new Map(), graphql: new Map(), external: new Map(), emails: new Map(), config: new Map(), comments: new Map(),
+      scripts: [],
+    };
+  }
+
+  // ---- v0.38: contexto de cada llamada (método HTTP y claves del body/params) ----
+  // En código minificado la llamada suele verse como axios.post("/x",{a:1}) o
+  // fetch("/x",{method:"POST",body:JSON.stringify({a:1})}); mirando unos
+  // caracteres antes/después del literal se recupera el método y los nombres
+  // de parámetros que la UI manda -- exactamente lo que hace falta para armar
+  // la petición a mano en Burp sin haber ejecutado la funcionalidad.
+  const METHOD_BEFORE_RE = /\.(get|post|put|patch|delete|head|options)\s*\(\s*$/i;
+  const METHOD_AFTER_RE = /(?:method|type)\s*:\s*["'`](GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)["'`]/i;
+  const NOISE_KEYS = new Set(["method", "headers", "credentials", "body", "mode", "cache", "signal", "redirect", "referrer", "keepalive", "data", "params", "url", "type", "contentType", "dataType", "success", "error", "timeout", "withCredentials", "responseType", "baseURL", "Content-Type", "Accept", "Authorization", "json"]);
+  function objectKeys(src) {
+    const keys = [];
+    const re = /(?:^|[,{\s])(?:"([A-Za-z_$][\w$.-]{0,40})"|'([A-Za-z_$][\w$.-]{0,40})'|([A-Za-z_$][\w$]{0,40}))\s*:/g;
+    let m;
+    while ((m = re.exec(src)) !== null && keys.length < 15) {
+      const k = m[1] || m[2] || m[3];
+      if (k && !NOISE_KEYS.has(k) && !keys.includes(k)) keys.push(k);
+    }
+    return keys;
+  }
+  function inferRequestShape(text, start, end) {
+    const before = text.slice(Math.max(0, start - 48), start);
+    let after = text.slice(end, end + 340);
+    // Acotar al llamado actual: en bundles minificados las llamadas van pegadas y
+    // sin esto los parámetros de la siguiente petición se atribuyen a esta.
+    const cut = after.search(/;|\bfetch\s*\(|\baxios\b|\$\.ajax\s*\(|\.(?:get|post|put|patch|delete)\s*\(/i);
+    if (cut > 0) after = after.slice(0, cut);
+    let method = null;
+    let mm = METHOD_BEFORE_RE.exec(before);
+    if (mm) method = mm[1].toUpperCase();
+    if (!method) { mm = METHOD_AFTER_RE.exec(after); if (mm) method = mm[1].toUpperCase(); }
+    const keys = [];
+    const add = (re) => {
+      const r = re.exec(after);
+      if (r) for (const k of objectKeys(r[1])) if (!keys.includes(k) && keys.length < 15) keys.push(k);
+    };
+    add(/JSON\.stringify\(\s*\{([^}]{0,300})\}/);
+    add(/\b(?:data|body|json|params)\s*:\s*\{([^}]{0,300})\}/);
+    if (!method || /^(?:POST|PUT|PATCH)$/.test(method)) add(/^\s*,\s*\{([^}]{0,300})\}/);
+    return { method, keys, dynamic: /^\s*\+/.test(after) };
+  }
+
+  const HOST_SKIP_RE = /(?:w3\.org|schema\.org|googleapis\.com\/css|fonts\.g|gstatic|reactjs\.org|github\.com\/|mozilla\.org|npmjs|json-schema\.org|ietf\.org)/i;
+  const GQL_OP_RE = /\b(query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]{2,60})\s*(?:\([^)]{0,200}\))?\s*\{/g;
+  const ROUTE_RE = /\bpath\s*:\s*["'`](\/[^"'`\s]{1,120})["'`]/g;
+  const EMAIL_RE = /\b[A-Za-z0-9._%+-]{2,40}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,10}\b/g;
+  const CONFIG_RE = /\b((?:NEXT_PUBLIC|REACT_APP|VITE|VUE_APP|NUXT_PUBLIC|GATSBY|EXPO_PUBLIC)_[A-Z0-9_]{2,50}|(?:ENABLE|FEATURE|FLAG|DISABLE)_[A-Z0-9_]{3,50})\b["']?\s*[:=]\s*(?:["'`]([^"'`\n]{0,120})["'`]|(true|false|\d{1,10})\b)/g;
+  const COMMENT_RE = /(?:(?<![:\w])\/\/(?!\/)|\/\*+|<!--)\s*((?:TODO|FIXME|HACK|XXX|BUG|SECURITY)\b[^\n*]{3,200}|[^\n*]{0,60}\b(?:password|passwd|secret|api[_ -]?key|credentials?|internal only|do not (?:commit|deploy|ship)|remove (?:before|in prod)|hard-?coded)\b[^\n*]{0,120})/gi;
+
+  // v0.38.1: URLs de relleno que usan las librerías (new URL("http://a/")) no son del objetivo.
+  const DUMMY_HOST_RE = /^(?:[a-z]|localhost|127\.0\.0\.1|0\.0\.0\.0|example\.(?:com|org|net)|[^.]+\.(?:invalid|test|example))$/i;
+  // Fragmento de código alrededor del literal: es lo que permite entender, al ampliar la ruta,
+  // cómo se usa (qué función la llama, con qué datos) sin abrir el bundle a mano.
+  function addContext(e, source, text, start, end) {
+    if (!e) return;
+    e.contexts = e.contexts || [];
+    if (e.contexts.length >= 2 || e.contexts.some((c) => c.source === source)) return;
+    e.contexts.push({ source: String(source).slice(0, 400), snippet: text.slice(Math.max(0, start - 90), Math.min(text.length, end + 110)).replace(/\s+/g, " ").trim() });
+  }
+
+  function normalizeTemplate(path) {
+    return path.replace(/\$\{[^}]*\}/g, "{param}");
+  }
+  function touch(map, key, base, source, cap) {
+    let e = map.get(key);
+    if (!e) {
+      if (map.size >= cap) return null;
+      e = { ...base, sources: [] };
+      map.set(key, e);
+    }
+    if (source && e.sources.length < 3 && !e.sources.includes(source)) e.sources.push(source);
+    return e;
   }
 
   function extractJsIntel(text, source, intel) {
     if (typeof text !== "string" || text.length < 20) return;
     const pageBase = baseDomain(location.hostname);
-    // Endpoints absolutos (también alimentan hosts / entornos no productivos)
     let m;
+    // Endpoints absolutos (también alimentan hosts / entornos no productivos / terceros)
     ABS_URL_RE.lastIndex = 0;
     while ((m = ABS_URL_RE.exec(text)) !== null && intel.endpoints.size < 600) {
       const url = m[1];
       let u;
       try { u = new URL(url); } catch { continue; }
-      if (STATIC_ASSET_RE.test(u.pathname)) continue;
-      if (/hooks\.slack\.com|discord(?:app)?\.com\/api\/webhooks/i.test(u.host + u.pathname)) continue; // ya se reporta como secreto; no duplicar el valor en la lista de rutas
-      if (/(?:w3\.org|schema\.org|googleapis\.com\/css|fonts\.g|gstatic|reactjs\.org|github\.com\/|mozilla\.org|npmjs)/i.test(u.host + u.pathname)) continue;
-      const key = "abs:" + u.origin + u.pathname;
-      if (!intel.endpoints.has(key)) intel.endpoints.set(key, { path: u.pathname + (u.search ? u.search.slice(0, 120) : ""), origin: u.origin, abs: true, hint: API_HINT_RE.test(u.pathname), sources: [] });
-      const e = intel.endpoints.get(key);
-      if (e.sources.length < 3 && !e.sources.includes(source)) e.sources.push(source);
-      u.searchParams.forEach((_v, k) => { if (k.length <= 32 && /^[A-Za-z_][\w.-]*$/.test(k)) intel.params.add(k); });
       const h = u.hostname.toLowerCase();
+      if (DUMMY_HOST_RE.test(h)) continue;
+      if (!HOST_SKIP_RE.test(u.host + u.pathname) && baseDomain(h) !== pageBase) {
+        const ex = touch(intel.external, h, { host: h, count: 0 }, source, 200);
+        if (ex) ex.count++;
+      }
+      if (STATIC_ASSET_RE.test(u.pathname)) continue;
+      if (/hooks\.slack\.com|discord(?:app)?\.com\/api\/webhooks/i.test(u.host + u.pathname)) continue; // ya se reporta como secreto; no duplicar el valor
+      if (HOST_SKIP_RE.test(u.host + u.pathname)) continue;
+      const shape = inferRequestShape(text, m.index, m.index + m[0].length);
+      const key = "abs:" + u.origin + u.pathname;
+      const e = touch(intel.endpoints, key, { path: u.pathname + (u.search ? u.search.slice(0, 120) : ""), origin: u.origin, abs: true, hint: API_HINT_RE.test(u.pathname), methods: [], bodyKeys: [], dynamic: false }, source, 600);
+      if (e) { mergeShape(e, shape); addContext(e, source, text, m.index, m.index + m[0].length); }
+      u.searchParams.forEach((_v, k) => { if (k.length <= 32 && /^[A-Za-z_][\w.-]*$/.test(k)) intel.params.add(k); });
       if (baseDomain(h) === pageBase && h !== location.hostname.toLowerCase()) {
-        const rec = intel.hosts.get(h) || { host: h, envLike: ENV_SUBDOMAIN_RE.test(h + "."), sources: [] };
-        if (rec.sources.length < 3 && !rec.sources.includes(source)) rec.sources.push(source);
-        intel.hosts.set(h, rec);
+        touch(intel.hosts, h, { host: h, envLike: ENV_SUBDOMAIN_RE.test(h + ".") }, source, 200);
       }
     }
     // Rutas relativas (priorizamos las que parecen API; el resto solo si tienen 2+ segmentos)
     REL_PATH_RE.lastIndex = 0;
     while ((m = REL_PATH_RE.exec(text)) !== null && intel.endpoints.size < 600) {
-      const path = m[1];
+      const path = normalizeTemplate(m[1]);
       if (path.startsWith("//") || STATIC_ASSET_RE.test(path)) continue;
+      const pathOnly = path.split("?")[0];
+      if (/^\/(?:api|rest|v\d{1,2})\/?$/i.test(pathOnly)) continue; // "/api" a secas es ruido
       const hint = API_HINT_RE.test(path);
-      const segs = path.split("?")[0].split("/").filter(Boolean);
+      const segs = pathOnly.split("/").filter(Boolean);
       if (!hint && segs.length < 2) continue;
       if (!hint && /[{}$]/.test(path) === false && segs.every((x) => x.length <= 2)) continue;
-      const key = "rel:" + path.split("?")[0];
-      if (!intel.endpoints.has(key)) intel.endpoints.set(key, { path: path.slice(0, 200), origin: location.origin, abs: false, hint, sources: [] });
-      const e = intel.endpoints.get(key);
-      if (e.sources.length < 3 && !e.sources.includes(source)) e.sources.push(source);
+      const shape = inferRequestShape(text, m.index, m.index + m[0].length);
+      const key = "rel:" + pathOnly;
+      const e = touch(intel.endpoints, key, { path: path.slice(0, 200), origin: location.origin, abs: false, hint, methods: [], bodyKeys: [], dynamic: false }, source, 600);
+      if (e) { mergeShape(e, shape); addContext(e, source, text, m.index, m.index + m[0].length); }
       const q = path.split("?")[1];
       if (q) q.split("&").forEach((kv) => { const k = kv.split("=")[0]; if (k && k.length <= 32 && /^[A-Za-z_][\w.-]*$/.test(k)) intel.params.add(k); });
+    }
+    // Rutas del front (React Router / Vue Router / Next): páginas, no API.
+    ROUTE_RE.lastIndex = 0;
+    while ((m = ROUTE_RE.exec(text)) !== null && intel.routes.size < 300) {
+      const r = normalizeTemplate(m[1]);
+      if (r === "/" || r === "/*" || STATIC_ASSET_RE.test(r)) continue;
+      touch(intel.routes, r, { path: r.slice(0, 160) }, source, 300);
+    }
+    // Operaciones GraphQL embebidas en el JS (queries/mutations "persistidas" en el cliente).
+    GQL_OP_RE.lastIndex = 0;
+    while ((m = GQL_OP_RE.exec(text)) !== null && intel.graphql.size < 200) {
+      touch(intel.graphql, m[1] + " " + m[2], { kind: m[1].toLowerCase(), name: m[2], snippet: text.slice(m.index, m.index + 180).replace(/\s+/g, " ") }, source, 200);
+    }
+    // Config/env y feature flags que el build dejó en el cliente.
+    CONFIG_RE.lastIndex = 0;
+    while ((m = CONFIG_RE.exec(text)) !== null && intel.config.size < 120) {
+      const val = m[2] !== undefined ? m[2] : m[3];
+      touch(intel.config, m[1] + "=" + String(val).slice(0, 80), { name: m[1], value: String(val).slice(0, 120) }, source, 120);
+    }
+    // Emails (soporte, devs, cuentas de servicio).
+    EMAIL_RE.lastIndex = 0;
+    while ((m = EMAIL_RE.exec(text)) !== null && intel.emails.size < 60) {
+      // credenciales dentro de una URI (scheme://user:pass@host) no son un email
+      if (/:\/\/[^\s"'<>@]*:$/.test(text.slice(Math.max(0, m.index - 80), m.index))) continue;
+      const em = m[0].toLowerCase();
+      if (/@\d+x?\./.test(em) || /\.(?:png|jpe?g|gif|svg|webp|css|js)$/.test(em) || /@(?:example\.(?:com|org)|test\.com|domain\.com|email\.com|sentry\.io)$/.test(em)) continue;
+      touch(intel.emails, em, { email: em, sameDomain: baseDomain(em.split("@")[1]) === pageBase }, source, 60);
+    }
+    // Comentarios de desarrollo (builds sin minificar, HTML inline, source maps).
+    COMMENT_RE.lastIndex = 0;
+    while ((m = COMMENT_RE.exec(text)) !== null && intel.comments.size < 60) {
+      const c = m[1].trim().slice(0, 200);
+      if (c.length >= 8) touch(intel.comments, c, { text: c }, source, 60);
     }
     // Activos cloud (buckets/hosts potencialmente huérfanos)
     for (const c of CLOUD_RES) {
       c.re.lastIndex = 0;
       while ((m = c.re.exec(text)) !== null && intel.cloud.size < 150) {
         const value = m[0].slice(0, 160);
-        const key = c.kind + "|" + value;
-        if (!intel.cloud.has(key)) intel.cloud.set(key, { kind: c.kind, value, hint: c.hint, sources: [] });
-        const e = intel.cloud.get(key);
-        if (e.sources.length < 3 && !e.sources.includes(source)) e.sources.push(source);
+        touch(intel.cloud, c.kind + "|" + value, { kind: c.kind, value, hint: c.hint }, source, 150);
       }
     }
     // IPs / hosts internos filtrados en el cliente
     INTERNAL_RE.lastIndex = 0;
     while ((m = INTERNAL_RE.exec(text)) !== null && intel.internal.size < 60) {
-      const v = m[0];
-      if (!intel.internal.has(v)) intel.internal.set(v, { value: v, sources: [] });
-      const e = intel.internal.get(v);
-      if (e.sources.length < 3 && !e.sources.includes(source)) e.sources.push(source);
+      touch(intel.internal, m[0], { value: m[0] }, source, 60);
     }
   }
 
+  function mergeShape(e, shape) {
+    if (shape.method && e.methods.length < 4 && !e.methods.includes(shape.method)) e.methods.push(shape.method);
+    for (const k of shape.keys) if (e.bodyKeys.length < 15 && !e.bodyKeys.includes(k)) e.bodyKeys.push(k);
+    if (shape.dynamic) e.dynamic = true;
+  }
+
   function serializeIntel(intel) {
+    const arr = (map, n) => [...map.values()].slice(0, n);
     const out = {
       endpoints: [...intel.endpoints.values()].sort((a, b) => Number(b.hint) - Number(a.hint)).slice(0, 400),
-      cloud: [...intel.cloud.values()],
-      internal: [...intel.internal.values()],
-      hosts: [...intel.hosts.values()],
+      cloud: arr(intel.cloud, 150),
+      internal: arr(intel.internal, 60),
+      hosts: arr(intel.hosts, 200),
       params: [...intel.params].slice(0, 200),
+      routes: arr(intel.routes, 300),
+      graphql: arr(intel.graphql, 200),
+      external: arr(intel.external, 200),
+      emails: arr(intel.emails, 60),
+      config: arr(intel.config, 120),
+      comments: arr(intel.comments, 60),
+      scripts: intel.scripts.slice(0, 200),
     };
-    const empty = !out.endpoints.length && !out.cloud.length && !out.internal.length && !out.hosts.length && !out.params.length;
+    const empty = ["endpoints", "cloud", "internal", "hosts", "params", "routes", "graphql", "external", "emails", "config", "comments", "scripts"].every((k) => !out[k].length);
     return empty ? null : out;
   }
 
@@ -508,12 +631,15 @@
     async function scanScript(src, depth) {
       try {
         const res = await fetch(src, { credentials: "omit" });
+        if (res.ok === false) return; // 404/500: no es un script real (evita escanear páginas de error)
         const text = await res.text();
         const { secrets, jwts } = scanText(text, src);
         allSecrets.push(...secrets);
         allJwts.push(...jwts);
+        const before = intel.endpoints.size;
         extractJsIntel(text, src, intel);
         const mapUrl = detectSourceMapReference(text, src);
+        if (intel.scripts.length < 200) intel.scripts.push({ url: src.slice(0, 400), size: text.length, endpoints: intel.endpoints.size - before, sourceMap: !!mapUrl, chunk: depth > 0 });
         if (mapUrl) allSourceMaps.push({ scriptUrl: src, mapUrl });
         if (depth === 0 && chunkBudget > 0) {
           for (const u of discoverChunkRefs(text, src, seenScripts)) {
